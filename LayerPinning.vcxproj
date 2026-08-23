@@ -93,6 +93,7 @@
 
   <ItemGroup>
     <ClCompile Include="src\CoverWindow.cpp" />
+    <ClCompile Include="src\DrawHook.cpp" />
     <ClCompile Include="src\HostContext.cpp" />
     <ClCompile Include="src\HostImage.cpp" />
     <ClCompile Include="src\HostWindowHook.cpp" />
@@ -113,6 +114,7 @@
 
   <ItemGroup>
     <ClInclude Include="src\CoverWindow.h" />
+    <ClInclude Include="src\DrawHook.h" />
     <ClInclude Include="src\HostContext.h" />
     <ClInclude Include="src\HostImage.h" />
     <ClInclude Include="src\HostWindowHook.h" />
