@@ -98,12 +98,12 @@
     <ClCompile Include="src\InputRemap.cpp" />
     <ClCompile Include="src\LayerGeometry.cpp" />
     <ClCompile Include="src\LayerMenuHook.cpp" />
-    <ClCompile Include="src\LayerPinning.cpp" />
     <ClCompile Include="src\Log.cpp" />
     <ClCompile Include="src\OverlayWindow.cpp" />
     <ClCompile Include="src\PinState.cpp" />
     <ClCompile Include="src\PinningController.cpp" />
     <ClCompile Include="src\PinningStatus.cpp" />
+    <ClCompile Include="src\Plugin.cpp" />
     <ClCompile Include="src\RefreshRequest.cpp" />
     <ClCompile Include="src\SafeMemory.cpp" />
     <ClCompile Include="src\ScrollAnchor.cpp" />

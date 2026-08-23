@@ -37,9 +37,6 @@
     <ClCompile Include="src\LayerMenuHook.cpp">
       <Filter>ソース ファイル</Filter>
     </ClCompile>
-    <ClCompile Include="src\LayerPinning.cpp">
-      <Filter>ソース ファイル</Filter>
-    </ClCompile>
     <ClCompile Include="src\Log.cpp">
       <Filter>ソース ファイル</Filter>
     </ClCompile>
@@ -53,6 +50,9 @@
       <Filter>ソース ファイル</Filter>
     </ClCompile>
     <ClCompile Include="src\PinningStatus.cpp">
+      <Filter>ソース ファイル</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Plugin.cpp">
       <Filter>ソース ファイル</Filter>
     </ClCompile>
     <ClCompile Include="src\RefreshRequest.cpp">
