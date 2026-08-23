@@ -24,4 +24,8 @@ bool WriteIntSafe(int* p, int v) {
     __try { *p = v; return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+bool ReadPtrSafe(void* const* p, void** out) {
+    __try { *out = *p; return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 }
