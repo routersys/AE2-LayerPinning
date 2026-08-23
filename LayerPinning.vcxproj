@@ -67,7 +67,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>user32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>user32.lib;gdi32.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
@@ -94,6 +94,7 @@
   <ItemGroup>
     <ClCompile Include="src\CoverWindow.cpp" />
     <ClCompile Include="src\HostContext.cpp" />
+    <ClCompile Include="src\HostImage.cpp" />
     <ClCompile Include="src\HostWindowHook.cpp" />
     <ClCompile Include="src\InputRemap.cpp" />
     <ClCompile Include="src\LayerGeometry.cpp" />
@@ -113,6 +114,7 @@
   <ItemGroup>
     <ClInclude Include="src\CoverWindow.h" />
     <ClInclude Include="src\HostContext.h" />
+    <ClInclude Include="src\HostImage.h" />
     <ClInclude Include="src\HostWindowHook.h" />
     <ClInclude Include="src\InputRemap.h" />
     <ClInclude Include="src\LayerGeometry.h" />
