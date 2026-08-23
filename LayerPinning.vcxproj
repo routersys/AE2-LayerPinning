@@ -93,6 +93,7 @@
 
   <ItemGroup>
     <ClCompile Include="src\HostContext.cpp" />
+    <ClCompile Include="src\LayerGeometry.cpp" />
     <ClCompile Include="src\LayerPinning.cpp" />
     <ClCompile Include="src\Log.cpp" />
     <ClCompile Include="src\PinState.cpp" />
@@ -103,6 +104,7 @@
 
   <ItemGroup>
     <ClInclude Include="src\HostContext.h" />
+    <ClInclude Include="src\LayerGeometry.h" />
     <ClInclude Include="src\Log.h" />
     <ClInclude Include="src\PinState.h" />
     <ClInclude Include="src\PixelCache.h" />

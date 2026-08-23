@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "HostContext.h"
+#include "LayerGeometry.h"
 #include "Log.h"
 #include "PinState.h"
 #include "PixelCache.h"
@@ -42,111 +43,6 @@ struct WatchedState {
 };
 static WatchedState g_watch;
 
-struct Geometry {
-    bool valid = false;
-    RECT area = {};
-    int  rowHeight = 0;
-    int  row0Top = 0;
-    int  contentRight = 0;
-    int  displayLayerNum = 0;
-};
-static Geometry g_geo;
-
-static void ProbeGeometry(EDIT_SECTION* edit) {
-    if (!HostWindow() || !IsWindowVisible(HostWindow()) || IsIconic(HostWindow())) return;
-    RECT wr = {}; GetClientRect(HostWindow(), &wr);
-    POINT org = { 0, 0 }; ClientToScreen(HostWindow(), &org);
-    const int W = wr.right, H = wr.bottom;
-    if (W <= 0 || H <= 0) return;
-
-    auto layerAt = [&](int x, int y) -> int {
-        int layer = -1, frame = -1;
-        if (!edit->pos_to_layer_frame(org.x + x, org.y + y, &layer, &frame)) return -1;
-        return layer;
-    };
-    auto hit = [&](int x, int y) { return layerAt(x, y) >= 0; };
-
-    int hx = -1, hy = -1;
-    for (int y = 0; y < H && hx < 0; y += 24)
-        for (int x = 0; x < W; x += 24)
-            if (hit(x, y)) { hx = x; hy = y; break; }
-    if (hx < 0) { g_geo.valid = false; return; }
-
-    int x0 = hx; while (x0 > 0     && hit(x0 - 1, hy)) x0--;
-    int x1 = hx; while (x1 < W - 1 && hit(x1 + 1, hy)) x1++;
-    int y0 = hy; while (y0 > 0     && hit(hx, y0 - 1)) y0--;
-    int y1 = hy; while (y1 < H - 1 && hit(hx, y1 + 1)) y1++;
-
-    int b1 = -1, b2 = -1, prev = layerAt(hx, y0);
-    for (int y = y0; y <= y1; y++) {
-        int cur = layerAt(hx, y);
-        if (cur == prev) continue;
-        prev = cur;
-        if (b1 < 0) b1 = y; else { b2 = y; break; }
-    }
-    if (b1 < 0 || b2 < 0) { g_geo.valid = false; return; }
-
-    RECT area = { x0, y0, x1 + 1, y1 + 1 };
-    if (area.right  > W) area.right  = W;
-    if (area.bottom > H) area.bottom = H;
-
-    int rowHeight = b2 - b1;
-    int sbLogical  = LayoutSize("ScrollBarSize");
-    int rowLogical = LayoutSize("LayerHeight");
-    double scale = (rowLogical > 0) ? (double)rowHeight / rowLogical : 1.0;
-    int contentRight = area.right - (int)(sbLogical * scale + 0.5);
-    if (contentRight <= area.left) contentRight = area.right;
-
-    const EDIT_INFO info = EditInfo();
-
-    g_geo.area = area;
-    g_geo.rowHeight = rowHeight;
-    g_geo.row0Top = b1 - rowHeight;
-    g_geo.contentRight = contentRight;
-    g_geo.displayLayerNum = info.display_layer_num;
-    g_geo.valid = rowHeight > 0 && g_geo.row0Top >= 0;
-
-    LogF(L"geometry: area=(%d,%d)-(%d,%d) rowHeight=%d row0Top=%d contentRight=%d layers=%d",
-         area.left, area.top, area.right, area.bottom,
-         rowHeight, g_geo.row0Top, contentRight, info.display_layer_num);
-}
-
-static void RequestProbeGeometry() {
-    CallEditSection([](EDIT_SECTION* e) { ProbeGeometry(e); });
-}
-
-static bool LayerAreaRect(RECT* out) {
-    if (!g_geo.valid) return false;
-    RECT cli = {}; GetClientRect(HostWindow(), &cli);
-    RECT rc = g_geo.area;
-    if (rc.right  > cli.right)  rc.right  = cli.right;
-    if (rc.bottom > cli.bottom) rc.bottom = cli.bottom;
-    if (rc.right <= rc.left || rc.bottom <= rc.top) return false;
-    *out = rc;
-    return true;
-}
-
-static int VisiblePinRows() {
-    if (PinCount() <= 0) return 0;
-    int rows = PinCount();
-    if (g_geo.displayLayerNum > 1 && rows > g_geo.displayLayerNum - 1)
-        rows = g_geo.displayLayerNum - 1;
-    return rows > 0 ? rows : 0;
-}
-
-static bool PinnedStripRect(RECT* out) {
-    const int rows = VisiblePinRows();
-    if (!g_geo.valid || rows <= 0) return false;
-    RECT cli = {}; GetClientRect(HostWindow(), &cli);
-    RECT rc = { g_geo.area.left, g_geo.row0Top,
-                g_geo.contentRight, g_geo.row0Top + rows * g_geo.rowHeight };
-    if (rc.right  > cli.right)  rc.right  = cli.right;
-    if (rc.bottom > cli.bottom) rc.bottom = cli.bottom;
-    if (rc.right <= rc.left || rc.bottom <= rc.top) return false;
-    *out = rc;
-    return true;
-}
-
 static PixelCache g_stripCache;
 static PixelCache g_lowerCache;
 static bool g_stripValid = false;
@@ -176,7 +72,7 @@ static unsigned long long HashStrip() {
 }
 
 static bool PinningActive() {
-    return PinCount() > 0 && g_geo.valid && HasStartPointer();
+    return PinCount() > 0 && GeometryValid() && HasStartPointer();
 }
 
 static void UpdateOverlayPlacement(int v);
@@ -233,7 +129,7 @@ static bool RefreshStrip() {
         HDC wdc = GetDC(HostWindow());
         if (wdc) {
             const bool needSwap = (v != 0);
-            RECT lower = { area.left, strip.bottom, area.right, area.bottom };
+            const RECT lower = LowerRegionRect(area, strip);
             const int lw = lower.right - lower.left, lh = lower.bottom - lower.top;
             bool covered = false;
 
@@ -430,7 +326,7 @@ static void OnTick() {
         g_watch.frame      = info.frame;
         if (info.display_layer_num != g_watch.layerNum) {
             g_watch.layerNum = info.display_layer_num;
-            g_geo.displayLayerNum = info.display_layer_num;
+            SetDisplayLayerNum(info.display_layer_num);
             g_stripValid = false;
         }
         RequestRefresh();
@@ -475,10 +371,9 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 }
 
 static bool CoverLowerRegion() {
-    if (!g_cover || !g_geo.valid) return false;
-    RECT area, strip;
-    if (!LayerAreaRect(&area) || !PinnedStripRect(&strip)) return false;
-    RECT lower = { area.left, strip.bottom, area.right, area.bottom };
+    if (!g_cover || !GeometryValid()) return false;
+    RECT lower;
+    if (!LowerRegionRect(&lower)) return false;
     const int w = lower.right - lower.left, h = lower.bottom - lower.top;
     if (w <= 0 || h <= 0) return false;
 
@@ -502,9 +397,8 @@ static bool CoverLowerRegion() {
 
 static void UncoverLowerRegion() {
     if (!g_cover) return;
-    RECT area, strip;
-    if (LayerAreaRect(&area) && PinnedStripRect(&strip) && g_lowerCache.dc) {
-        RECT lower = { area.left, strip.bottom, area.right, area.bottom };
+    RECT lower;
+    if (LowerRegionRect(&lower) && g_lowerCache.dc) {
         const int w = lower.right - lower.left, h = lower.bottom - lower.top;
         if (w == g_lowerCache.w && h == g_lowerCache.h) {
             HDC wdc = GetDC(HostWindow());
@@ -515,17 +409,8 @@ static void UncoverLowerRegion() {
         }
     }
     ShowWindow(g_cover, SW_HIDE);
+    RECT area;
     if (LayerAreaRect(&area)) RedrawWindow(HostWindow(), &area, nullptr, RDW_INVALIDATE);
-}
-
-static bool PointInPinnedStrip(POINT ptClient) {
-    RECT strip;
-    if (!PinnedStripRect(&strip)) return false;
-    return PtInRect(&strip, ptClient) != 0;
-}
-static bool CursorInPinnedStrip(LPARAM lp) {
-    POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-    return PointInPinnedStrip(pt);
 }
 
 static LRESULT HandleContextMenu(HWND hwnd, WPARAM wp, LPARAM lp, bool* handled) {
@@ -621,7 +506,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_RBUTTONDOWN: case WM_RBUTTONUP:
         case WM_MBUTTONDOWN: case WM_MBUTTONUP:
         case WM_CAPTURECHANGED: {
-            const bool onScrollBar = g_geo.valid && GET_X_LPARAM(lp) >= g_geo.contentRight;
+            const bool onScrollBar = GeometryValid() && GET_X_LPARAM(lp) >= ContentRight();
             const bool dragging = (wp & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) != 0;
             if (!onScrollBar && (msg != WM_MOUSEMOVE || dragging || CursorInPinnedStrip(lp))) {
                 if (msg != WM_MOUSEMOVE) g_idleStreak = 0;
@@ -746,26 +631,6 @@ static void RemoveIfEmptySubmenu(HMENU root, HMENU sub) {
     if (parent) RemoveMenu(parent, ppos, MF_BYPOSITION);
 }
 
-static int LayerUnderCursor(int screenX, int screenY) {
-    if (!HostWindow()) return -1;
-    if (!g_geo.valid) {
-        if (!Edit()) return -1;
-        return EditInfo().layer;
-    }
-    POINT pt = { screenX, screenY };
-    ScreenToClient(HostWindow(), &pt);
-    if (pt.x < g_geo.area.left || pt.x >= g_geo.contentRight) return -1;
-    if (pt.y < g_geo.row0Top || pt.y >= g_geo.area.bottom) return -1;
-
-    int row = (pt.y - g_geo.row0Top) / g_geo.rowHeight;
-    if (PinCount() > 0 && row < PinCount()) return row;
-
-    int start = 0;
-    if (HasStartPointer()) { if (!ReadStart(&start)) start = ReadStartThroughSdk(); }
-    else start = ReadStartThroughSdk();
-    return start + row;
-}
-
 
 typedef BOOL (WINAPI* TrackPopupMenu_t)(HMENU, UINT, int, int, int, HWND, const RECT*);
 static TrackPopupMenu_t g_origTPM = nullptr;
@@ -821,7 +686,7 @@ static BOOL WINAPI Hook_TrackPopupMenu(HMENU menu, UINT flags, int x, int y,
 }
 
 static void ApplyPinChange(EDIT_SECTION* edit, bool wantPin) {
-    if (!g_geo.valid) ProbeGeometry(edit);
+    if (!GeometryValid()) ProbeGeometry(edit);
 
     int layer = g_menuLayer;
     if (layer < 0) {
@@ -865,8 +730,8 @@ static void OnAnyEvent(void*) {
     RequestRefresh();
     if (!Edit()) return;
     const EDIT_INFO info = EditInfo();
-    if (info.display_layer_num != g_geo.displayLayerNum) {
-        g_geo.displayLayerNum = info.display_layer_num;
+    if (info.display_layer_num != DisplayLayerNum()) {
+        SetDisplayLayerNum(info.display_layer_num);
         g_stripValid = false;
         RequestProbeGeometry();
     }

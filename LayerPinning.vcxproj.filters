@@ -22,6 +22,9 @@
     <ClCompile Include="src\HostContext.cpp">
       <Filter>ソース ファイル</Filter>
     </ClCompile>
+    <ClCompile Include="src\LayerGeometry.cpp">
+      <Filter>ソース ファイル</Filter>
+    </ClCompile>
     <ClCompile Include="src\LayerPinning.cpp">
       <Filter>ソース ファイル</Filter>
     </ClCompile>
@@ -43,6 +46,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\HostContext.h">
+      <Filter>ヘッダー ファイル</Filter>
+    </ClInclude>
+    <ClInclude Include="src\LayerGeometry.h">
       <Filter>ヘッダー ファイル</Filter>
     </ClInclude>
     <ClInclude Include="src\Log.h">
