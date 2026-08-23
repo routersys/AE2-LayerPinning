@@ -8,6 +8,7 @@
 
 #include "Log.h"
 #include "PixelCache.h"
+#include "RefreshRequest.h"
 #include "SafeMemory.h"
 
 using namespace lp;
@@ -26,7 +27,6 @@ static int g_pinCount = 0;
 static int* g_pStart = nullptr;
 static volatile LONG g_locating     = 0;
 static volatile LONG g_suppressPaint = 0;
-static volatile LONG g_dirty        = 1;
 static volatile LONG g_refreshing   = 0;
 static bool g_remapping = false;
 
@@ -273,7 +273,7 @@ static bool LocateStartPointer() {
 
     InterlockedExchange(&g_suppressPaint, 0);
     if (g_host) InvalidateRect(g_host, nullptr, FALSE);
-    InterlockedExchange(&g_dirty, 1);
+    RequestRefresh();
     InterlockedExchange(&g_locating, 0);
     return ok;
 }
@@ -578,22 +578,22 @@ static void OnTick() {
             g_geo.displayLayerNum = info.display_layer_num;
             g_stripValid = false;
         }
-        InterlockedExchange(&g_dirty, 1);
+        RequestRefresh();
     }
 
-    bool dirty = InterlockedExchange(&g_dirty, 0) != 0;
+    bool dirty = TakeRefreshRequest();
 
     if (dirty && g_stripValid) {
         const ULONGLONG minGap = (ULONGLONG)kTimerMs * (1 + g_idleStreak);
         if (GetTickCount64() - g_lastRefresh < minGap) {
-            InterlockedExchange(&g_dirty, 1);
+            RequestRefresh();
             dirty = false;
         }
     }
     if (!g_stripValid) dirty = true;
 
     if (dirty && !g_locating && !g_coverUntil) RefreshStrip();
-    else if (dirty) InterlockedExchange(&g_dirty, 1);
+    else if (dirty) RequestRefresh();
     if (v != g_lastV) g_lastV = v;
     UpdateOverlayPlacement(v);
 }
@@ -704,7 +704,7 @@ static void EndMenuRemap() {
     g_userV = g_menuRemapV;
     g_holdUntil = GetTickCount64() + kHoldMs;
     g_coverUntil = GetTickCount64() + kCoverMs;
-    InterlockedExchange(&g_dirty, 1);
+    RequestRefresh();
 }
 
 static LRESULT HandleMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool* handled) {
@@ -756,7 +756,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_stripCache.Release();
             g_lowerCache.Release();
             g_stripValid = false;
-            InterlockedExchange(&g_dirty, 1);
+            RequestRefresh();
             RequestProbeGeometry();
             return r;
         }
@@ -770,7 +770,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const bool dragging = (wp & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) != 0;
             if (!onScrollBar && (msg != WM_MOUSEMOVE || dragging || CursorInPinnedStrip(lp))) {
                 if (msg != WM_MOUSEMOVE) g_idleStreak = 0;
-                InterlockedExchange(&g_dirty, 1);
+                RequestRefresh();
             }
             bool handled = false;
             LRESULT r = HandleMouse(hwnd, msg, wp, lp, &handled);
@@ -781,7 +781,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CONTEXTMENU: {
             bool handled = false;
             LRESULT r = HandleContextMenu(hwnd, wp, lp, &handled);
-            InterlockedExchange(&g_dirty, 1);
+            RequestRefresh();
             if (handled) return r;
             break;
         }
@@ -789,7 +789,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COMMAND: {
             LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
             EndMenuRemap();
-            InterlockedExchange(&g_dirty, 1);
+            RequestRefresh();
             return r;
         }
 
@@ -798,7 +798,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL ||
                 msg == WM_KEYDOWN || msg == WM_KEYUP)
                 g_holdUntil = 0;
-            InterlockedExchange(&g_dirty, 1);
+            RequestRefresh();
             break;
 
         case WM_DESTROY:
@@ -999,7 +999,7 @@ static void ApplyPinChange(EDIT_SECTION* edit, bool wantPin) {
 
     g_pinByScene[g_sceneId] = g_pinCount;
     g_stripValid = false;
-    InterlockedExchange(&g_dirty, 1);
+    RequestRefresh();
     LogF(L"pinCount %d -> %d (layer %d, scene %d)", before, g_pinCount, layer, g_sceneId);
 
     EnsureOverlay();
@@ -1018,14 +1018,14 @@ static void OnChangeScene(EDIT_SECTION* edit) {
     g_pinCount = (it == g_pinByScene.end()) ? 0 : it->second;
     g_pStart = nullptr;
     g_stripValid = false;
-    InterlockedExchange(&g_dirty, 1);
+    RequestRefresh();
     ProbeGeometry(edit);
     if (g_pinCount > 0) EnsureStartPointerAsync();
 }
 
 static void OnAnyEvent(void*) {
     g_idleStreak = 0;
-    InterlockedExchange(&g_dirty, 1);
+    RequestRefresh();
     if (!g_edit) return;
     EDIT_INFO info = {};
     g_edit->get_edit_info(&info, sizeof(info));
