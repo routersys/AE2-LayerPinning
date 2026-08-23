@@ -7,7 +7,7 @@
 #include "PinState.h"
 #include "PixelCache.h"
 #include "RefreshRequest.h"
-#include "SafeMemory.h"
+#include "ScrollAnchor.h"
 
 using namespace lp;
 
@@ -15,9 +15,6 @@ static HWND           g_overlay = nullptr;
 static HWND           g_cover   = nullptr;
 static WNDPROC        g_origProc = nullptr;
 
-static int* g_pStart = nullptr;
-static volatile LONG g_locating     = 0;
-static volatile LONG g_suppressPaint = 0;
 static volatile LONG g_refreshing   = 0;
 static bool g_remapping = false;
 
@@ -150,135 +147,6 @@ static bool PinnedStripRect(RECT* out) {
     return true;
 }
 
-static void ScanFull(int wanted, std::vector<int*>& out) {
-    out.clear();
-    NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
-    BYTE* stackLo = (BYTE*)tib->StackLimit;
-    BYTE* stackHi = (BYTE*)tib->StackBase;
-
-    SYSTEM_INFO si; GetSystemInfo(&si);
-    BYTE* p   = (BYTE*)si.lpMinimumApplicationAddress;
-    BYTE* end = (BYTE*)si.lpMaximumApplicationAddress;
-    MEMORY_BASIC_INFORMATION mbi;
-    std::vector<int*> tmp(1 << 16);
-    while (p < end && VirtualQuery(p, &mbi, sizeof(mbi))) {
-        BYTE* next = (BYTE*)mbi.BaseAddress + mbi.RegionSize;
-        bool rw = mbi.State == MEM_COMMIT &&
-                  (mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_WRITECOPY);
-        bool ownStack = ((BYTE*)mbi.BaseAddress < stackHi) && (next > stackLo);
-        if (rw && !ownStack && mbi.RegionSize <= (32u << 20)) {
-            size_t found = ScanBlockSafe((int*)mbi.BaseAddress, mbi.RegionSize / sizeof(int),
-                                         wanted, tmp.data(), tmp.size());
-            size_t take = found < tmp.size() ? found : tmp.size();
-            for (size_t i = 0; i < take; i++) out.push_back(tmp[i]);
-        }
-        if (out.size() > 1000000) break;
-        if (next <= p) break;
-        p = next;
-    }
-}
-
-static void FilterCands(int wanted, std::vector<int*>& cands) {
-    std::vector<int*> keep;
-    keep.reserve(cands.size());
-    for (int* a : cands) { int v; if (ReadIntSafe(a, &v) && v == wanted) keep.push_back(a); }
-    cands.swap(keep);
-}
-
-static int g_setRequest = 0;
-static int SetStartThroughSdk(int value) {
-    g_setRequest = value;
-    CallEditSection([](EDIT_SECTION* e) {
-        e->set_display_layer_frame(g_setRequest, e->info->display_frame_start);
-    });
-    return EditInfo().display_layer_start;
-}
-static int ReadStartThroughSdk() {
-    return EditInfo().display_layer_start;
-}
-static bool StartPointerLooksValid() {
-    if (!g_pStart) return false;
-    int v;
-    return ReadIntSafe(g_pStart, &v) && v == ReadStartThroughSdk();
-}
-
-static bool LocateStartPointer() {
-    if (!Edit()) return false;
-    if (InterlockedCompareExchange(&g_locating, 1, 0) != 0) return false;
-
-    InterlockedExchange(&g_suppressPaint, 1);
-    const int original = ReadStartThroughSdk();
-    bool ok = false;
-
-    const int maxScroll = SetStartThroughSdk(1 << 20);
-    if (maxScroll >= 1) {
-        std::vector<int> probes;
-        if (maxScroll >= 3) {
-            for (int p : { maxScroll, maxScroll / 2, 1, maxScroll / 3, 2, maxScroll - 1 }) {
-                bool dup = false;
-                for (int q : probes) if (q == p) { dup = true; break; }
-                if (!dup && p >= 0 && p <= maxScroll) probes.push_back(p);
-            }
-        } else {
-            for (int i = 0; i < 14; i++) probes.push_back((i % 2) ? 0 : maxScroll);
-        }
-
-        std::vector<int*> cands;
-        bool first = true;
-        for (int p : probes) {
-            if (SetStartThroughSdk(p) != p) continue;
-            if (first) { ScanFull(p, cands); first = false; }
-            else FilterCands(p, cands);
-            if (!first && cands.size() <= 8) break;
-        }
-
-        const int before = ReadStartThroughSdk();
-        const int probe = (before == 1) ? 0 : 1;
-        for (int* addr : cands) {
-            int save;
-            if (!ReadIntSafe(addr, &save)) continue;
-            if (!WriteIntSafe(addr, probe)) continue;
-            const bool match = (ReadStartThroughSdk() == probe);
-            WriteIntSafe(addr, save);
-            if (match) { g_pStart = addr; ok = true; break; }
-        }
-        if (ok)
-            LogF(L"レイヤー固定: 表示開始レイヤー番号の位置を特定しました "
-                 L"(maxScroll=%d candidates=%zu)", maxScroll, cands.size());
-        else
-            LogWarn(L"レイヤー固定: 表示開始レイヤー番号を特定できませんでした。"
-                    L"固定は無効のままになります。");
-    } else {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            LogF(L"レイヤー固定: まだ縦スクロール出来ないので位置の特定を保留します。"
-                 L"レイヤーが増えたら自動でやり直します。");
-        }
-    }
-
-    if (g_pStart) WriteIntSafe(g_pStart, original);
-    if (ReadStartThroughSdk() != original) SetStartThroughSdk(original);
-
-    InterlockedExchange(&g_suppressPaint, 0);
-    if (HostWindow()) InvalidateRect(HostWindow(), nullptr, FALSE);
-    RequestRefresh();
-    InterlockedExchange(&g_locating, 0);
-    return ok;
-}
-
-static ULONGLONG g_lastLocateTry = 0;
-static void EnsureStartPointerAsync() {
-    if (g_locating) return;
-    if (g_pStart && StartPointerLooksValid()) return;
-    const ULONGLONG now = GetTickCount64();
-    if (g_lastLocateTry && now - g_lastLocateTry < 1000) return;
-    g_lastLocateTry = now;
-    g_pStart = nullptr;
-    CreateThread(nullptr, 0, [](LPVOID) -> DWORD { LocateStartPointer(); return 0; },
-                 nullptr, 0, nullptr);
-}
-
 static PixelCache g_stripCache;
 static PixelCache g_lowerCache;
 static bool g_stripValid = false;
@@ -308,7 +176,7 @@ static unsigned long long HashStrip() {
 }
 
 static bool PinningActive() {
-    return PinCount() > 0 && g_geo.valid && g_pStart != nullptr;
+    return PinCount() > 0 && g_geo.valid && HasStartPointer();
 }
 
 static void UpdateOverlayPlacement(int v);
@@ -360,7 +228,7 @@ static bool RefreshStrip() {
     g_stripChanged = false;
     RECT area, strip;
     int v = 0;
-    if (LayerAreaRect(&area) && PinnedStripRect(&strip) && ReadIntSafe(g_pStart, &v)) {
+    if (LayerAreaRect(&area) && PinnedStripRect(&strip) && ReadStart(&v)) {
         const int sw = strip.right - strip.left, sh = strip.bottom - strip.top;
         HDC wdc = GetDC(HostWindow());
         if (wdc) {
@@ -383,7 +251,7 @@ static bool RefreshStrip() {
             if (hideOverlay) ShowWindow(g_overlay, SW_HIDE);
 
             if (needSwap) {
-                WriteIntSafe(g_pStart, 0);
+                WriteStart(0);
                 RedrawWindow(HostWindow(), &strip, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
                 WaitForHostToFinishDrawing(strip);
             }
@@ -404,7 +272,7 @@ static bool RefreshStrip() {
             }
 
             if (needSwap) {
-                WriteIntSafe(g_pStart, v);
+                WriteStart(v);
                 if (covered) BitBlt(wdc, lower.left, lower.top, lw, lh, g_lowerCache.dc, 0, 0, SRCCOPY);
                 else RedrawWindow(HostWindow(), &area, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
             }
@@ -516,7 +384,7 @@ static void OnTick() {
         if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
         return;
     }
-    if (!g_pStart) {
+    if (!HasStartPointer()) {
         if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
         const EDIT_INFO probe = EditInfo();
         if (probe.layer_max + 1 > probe.display_layer_num) EnsureStartPointerAsync();
@@ -527,7 +395,7 @@ static void OnTick() {
         return;
     }
     int v = 0;
-    if (!ReadIntSafe(g_pStart, &v)) return;
+    if (!ReadStart(&v)) return;
 
     if (g_coverUntil && GetTickCount64() >= g_coverUntil) {
         g_coverUntil = 0;
@@ -541,7 +409,7 @@ static void OnTick() {
 #ifdef LP_DEBUG_LOG
             LogF(L"  hold: host moved %d -> restoring %d", v, g_userV);
 #endif
-            WriteIntSafe(g_pStart, g_userV);
+            WriteStart(g_userV);
             v = g_userV;
             RECT area;
             if (LayerAreaRect(&area)) RedrawWindow(HostWindow(), &area, nullptr, RDW_INVALIDATE);
@@ -579,7 +447,7 @@ static void OnTick() {
     }
     if (!g_stripValid) dirty = true;
 
-    if (dirty && !g_locating && !g_coverUntil) RefreshStrip();
+    if (dirty && !Locating() && !g_coverUntil) RefreshStrip();
     else if (dirty) RequestRefresh();
     if (v != g_lastV) g_lastV = v;
     UpdateOverlayPlacement(v);
@@ -664,7 +532,7 @@ static LRESULT HandleContextMenu(HWND hwnd, WPARAM wp, LPARAM lp, bool* handled)
     *handled = false;
     if (!PinningActive()) return 0;
     int v;
-    if (!ReadIntSafe(g_pStart, &v) || v <= 0) return 0;
+    if (!ReadStart(&v) || v <= 0) return 0;
 
     POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
     if (lp == (LPARAM)-1 || (pt.x == -1 && pt.y == -1)) GetCursorPos(&pt);
@@ -676,7 +544,7 @@ static LRESULT HandleContextMenu(HWND hwnd, WPARAM wp, LPARAM lp, bool* handled)
     g_menuRemap = true;
     g_menuRemapV = v;
     g_menuRemapUntil = GetTickCount64() + kMenuRemapMs;
-    WriteIntSafe(g_pStart, 0);
+    WriteStart(0);
     LRESULT r = CallWindowProcW(g_origProc, hwnd, WM_CONTEXTMENU, wp, lp);
     *handled = true;
     return r;
@@ -687,7 +555,7 @@ static void EndMenuRemap() {
     g_menuRemap = false;
     g_menuRemapUntil = 0;
     g_remapping = false;
-    WriteIntSafe(g_pStart, g_menuRemapV);
+    WriteStart(g_menuRemapV);
     g_userV = g_menuRemapV;
     g_holdUntil = GetTickCount64() + kHoldMs;
     g_coverUntil = GetTickCount64() + kCoverMs;
@@ -701,7 +569,7 @@ static LRESULT HandleMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool* hand
 #endif
     if (!PinningActive()) return 0;
     int v;
-    if (!ReadIntSafe(g_pStart, &v)) return 0;
+    if (!ReadStart(&v)) return 0;
     if (v <= 0) return 0;
     if (!CursorInPinnedStrip(lp)) return 0;
 
@@ -715,9 +583,9 @@ static LRESULT HandleMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool* hand
     bool covered = button && CoverLowerRegion();
 
     g_remapping = true;
-    WriteIntSafe(g_pStart, 0);
+    WriteStart(0);
     LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
-    WriteIntSafe(g_pStart, v);
+    WriteStart(v);
     g_remapping = false;
 
     g_userV = v;
@@ -731,7 +599,7 @@ static LRESULT HandleMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool* hand
 static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_PAINT:
-            if (g_suppressPaint) {
+            if (PaintSuppressed()) {
                 PAINTSTRUCT ps; BeginPaint(hwnd, &ps); EndPaint(hwnd, &ps);
                 return 0;
             }
@@ -798,12 +666,12 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
 
-    if (g_holdUntil && g_pStart) {
+    if (g_holdUntil && HasStartPointer()) {
         if (GetTickCount64() >= g_holdUntil) {
             g_holdUntil = 0;
         } else {
             int cur;
-            if (ReadIntSafe(g_pStart, &cur) && cur != g_userV) WriteIntSafe(g_pStart, g_userV);
+            if (ReadStart(&cur) && cur != g_userV) WriteStart(g_userV);
         }
     }
     return r;
@@ -893,7 +761,7 @@ static int LayerUnderCursor(int screenX, int screenY) {
     if (PinCount() > 0 && row < PinCount()) return row;
 
     int start = 0;
-    if (g_pStart) { if (!ReadIntSafe(g_pStart, &start)) start = ReadStartThroughSdk(); }
+    if (HasStartPointer()) { if (!ReadStart(&start)) start = ReadStartThroughSdk(); }
     else start = ReadStartThroughSdk();
     return start + row;
 }
@@ -935,7 +803,7 @@ static BOOL WINAPI Hook_TrackPopupMenu(HMENU menu, UINT flags, int x, int y,
     }
 #ifdef LP_DEBUG_LOG
     {
-        int cur = -1; if (g_pStart) ReadIntSafe(g_pStart, &cur);
+        int cur = -1; if (HasStartPointer()) ReadStart(&cur);
         const EDIT_INFO info = EditInfo();
         LogF(L"  MENU OPEN: pStart=%d hostLayer=%d ourLayer=%d",
              cur, info.layer, g_menuLayer);
@@ -944,7 +812,7 @@ static BOOL WINAPI Hook_TrackPopupMenu(HMENU menu, UINT flags, int x, int y,
     BOOL r = g_origTPM(menu, flags, x, y, reserved, hwnd, rc);
 #ifdef LP_DEBUG_LOG
     {
-        int cur = -1; if (g_pStart) ReadIntSafe(g_pStart, &cur);
+        int cur = -1; if (HasStartPointer()) ReadStart(&cur);
         const EDIT_INFO info = EditInfo();
         LogF(L"  MENU CLOSED: pStart=%d hostLayer=%d", cur, info.layer);
     }
@@ -985,7 +853,7 @@ static void OnUnpinMenu(EDIT_SECTION* edit) { ApplyPinChange(edit, false); }
 
 static void OnChangeScene(EDIT_SECTION* edit) {
     SelectScene(edit->info->scene_id);
-    g_pStart = nullptr;
+    ResetStartPointer();
     g_stripValid = false;
     RequestRefresh();
     ProbeGeometry(edit);
