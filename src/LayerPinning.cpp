@@ -3,9 +3,7 @@
 #include <vector>
 #include <unordered_map>
 
-#include "plugin2.h"
-#include "config2.h"
-
+#include "HostContext.h"
 #include "Log.h"
 #include "PixelCache.h"
 #include "RefreshRequest.h"
@@ -13,9 +11,6 @@
 
 using namespace lp;
 
-static EDIT_HANDLE*   g_edit    = nullptr;
-static CONFIG_HANDLE* g_config  = nullptr;
-static HWND           g_host    = nullptr;
 static HWND           g_overlay = nullptr;
 static HWND           g_cover   = nullptr;
 static WNDPROC        g_origProc = nullptr;
@@ -65,9 +60,9 @@ struct Geometry {
 static Geometry g_geo;
 
 static void ProbeGeometry(EDIT_SECTION* edit) {
-    if (!g_host || !IsWindowVisible(g_host) || IsIconic(g_host)) return;
-    RECT wr = {}; GetClientRect(g_host, &wr);
-    POINT org = { 0, 0 }; ClientToScreen(g_host, &org);
+    if (!HostWindow() || !IsWindowVisible(HostWindow()) || IsIconic(HostWindow())) return;
+    RECT wr = {}; GetClientRect(HostWindow(), &wr);
+    POINT org = { 0, 0 }; ClientToScreen(HostWindow(), &org);
     const int W = wr.right, H = wr.bottom;
     if (W <= 0 || H <= 0) return;
 
@@ -103,13 +98,13 @@ static void ProbeGeometry(EDIT_SECTION* edit) {
     if (area.bottom > H) area.bottom = H;
 
     int rowHeight = b2 - b1;
-    int sbLogical  = g_config ? g_config->get_layout_size(g_config, "ScrollBarSize") : 0;
-    int rowLogical = g_config ? g_config->get_layout_size(g_config, "LayerHeight") : 0;
+    int sbLogical  = LayoutSize("ScrollBarSize");
+    int rowLogical = LayoutSize("LayerHeight");
     double scale = (rowLogical > 0) ? (double)rowHeight / rowLogical : 1.0;
     int contentRight = area.right - (int)(sbLogical * scale + 0.5);
     if (contentRight <= area.left) contentRight = area.right;
 
-    EDIT_INFO info = {}; g_edit->get_edit_info(&info, sizeof(info));
+    const EDIT_INFO info = EditInfo();
 
     g_geo.area = area;
     g_geo.rowHeight = rowHeight;
@@ -124,12 +119,12 @@ static void ProbeGeometry(EDIT_SECTION* edit) {
 }
 
 static void RequestProbeGeometry() {
-    if (g_edit) g_edit->call_edit_section([](EDIT_SECTION* e) { ProbeGeometry(e); });
+    CallEditSection([](EDIT_SECTION* e) { ProbeGeometry(e); });
 }
 
 static bool LayerAreaRect(RECT* out) {
     if (!g_geo.valid) return false;
-    RECT cli = {}; GetClientRect(g_host, &cli);
+    RECT cli = {}; GetClientRect(HostWindow(), &cli);
     RECT rc = g_geo.area;
     if (rc.right  > cli.right)  rc.right  = cli.right;
     if (rc.bottom > cli.bottom) rc.bottom = cli.bottom;
@@ -149,7 +144,7 @@ static int VisiblePinRows() {
 static bool PinnedStripRect(RECT* out) {
     const int rows = VisiblePinRows();
     if (!g_geo.valid || rows <= 0) return false;
-    RECT cli = {}; GetClientRect(g_host, &cli);
+    RECT cli = {}; GetClientRect(HostWindow(), &cli);
     RECT rc = { g_geo.area.left, g_geo.row0Top,
                 g_geo.contentRight, g_geo.row0Top + rows * g_geo.rowHeight };
     if (rc.right  > cli.right)  rc.right  = cli.right;
@@ -197,15 +192,13 @@ static void FilterCands(int wanted, std::vector<int*>& cands) {
 static int g_setRequest = 0;
 static int SetStartThroughSdk(int value) {
     g_setRequest = value;
-    g_edit->call_edit_section([](EDIT_SECTION* e) {
+    CallEditSection([](EDIT_SECTION* e) {
         e->set_display_layer_frame(g_setRequest, e->info->display_frame_start);
     });
-    EDIT_INFO chk = {}; g_edit->get_edit_info(&chk, sizeof(chk));
-    return chk.display_layer_start;
+    return EditInfo().display_layer_start;
 }
 static int ReadStartThroughSdk() {
-    EDIT_INFO info = {}; g_edit->get_edit_info(&info, sizeof(info));
-    return info.display_layer_start;
+    return EditInfo().display_layer_start;
 }
 static bool StartPointerLooksValid() {
     if (!g_pStart) return false;
@@ -214,7 +207,7 @@ static bool StartPointerLooksValid() {
 }
 
 static bool LocateStartPointer() {
-    if (!g_edit) return false;
+    if (!Edit()) return false;
     if (InterlockedCompareExchange(&g_locating, 1, 0) != 0) return false;
 
     InterlockedExchange(&g_suppressPaint, 1);
@@ -272,7 +265,7 @@ static bool LocateStartPointer() {
     if (ReadStartThroughSdk() != original) SetStartThroughSdk(original);
 
     InterlockedExchange(&g_suppressPaint, 0);
-    if (g_host) InvalidateRect(g_host, nullptr, FALSE);
+    if (HostWindow()) InvalidateRect(HostWindow(), nullptr, FALSE);
     RequestRefresh();
     InterlockedExchange(&g_locating, 0);
     return ok;
@@ -329,7 +322,7 @@ static void EndMenuRemap();
 static void WaitForHostToFinishDrawing(const RECT& rc) {
     const int w = rc.right - rc.left, h = rc.bottom - rc.top;
     if (w <= 0 || h <= 0) return;
-    HDC wdc = GetDC(g_host);
+    HDC wdc = GetDC(HostWindow());
     if (!wdc) return;
     HDC mdc = CreateCompatibleDC(wdc);
     HBITMAP bmp = CreateCompatibleBitmap(wdc, w, h);
@@ -357,7 +350,7 @@ static void WaitForHostToFinishDrawing(const RECT& rc) {
         if (stable < 2) Sleep(1);
     }
     SelectObject(mdc, old);
-    DeleteObject(bmp); DeleteDC(mdc); ReleaseDC(g_host, wdc);
+    DeleteObject(bmp); DeleteDC(mdc); ReleaseDC(HostWindow(), wdc);
 }
 
 static bool RefreshStrip() {
@@ -373,7 +366,7 @@ static bool RefreshStrip() {
     int v = 0;
     if (LayerAreaRect(&area) && PinnedStripRect(&strip) && ReadIntSafe(g_pStart, &v)) {
         const int sw = strip.right - strip.left, sh = strip.bottom - strip.top;
-        HDC wdc = GetDC(g_host);
+        HDC wdc = GetDC(HostWindow());
         if (wdc) {
             const bool needSwap = (v != 0);
             RECT lower = { area.left, strip.bottom, area.right, area.bottom };
@@ -395,7 +388,7 @@ static bool RefreshStrip() {
 
             if (needSwap) {
                 WriteIntSafe(g_pStart, 0);
-                RedrawWindow(g_host, &strip, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+                RedrawWindow(HostWindow(), &strip, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
                 WaitForHostToFinishDrawing(strip);
             }
 
@@ -417,9 +410,9 @@ static bool RefreshStrip() {
             if (needSwap) {
                 WriteIntSafe(g_pStart, v);
                 if (covered) BitBlt(wdc, lower.left, lower.top, lw, lh, g_lowerCache.dc, 0, 0, SRCCOPY);
-                else RedrawWindow(g_host, &area, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+                else RedrawWindow(HostWindow(), &area, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
             }
-            ReleaseDC(g_host, wdc);
+            ReleaseDC(HostWindow(), wdc);
 
             if (hideOverlay) {
                 InvalidateRect(g_overlay, nullptr, FALSE);
@@ -453,7 +446,7 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
 static LRESULT CALLBACK CoverProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
 
 static void EnsureOverlay() {
-    if (g_overlay || !g_host) return;
+    if (g_overlay || !HostWindow()) return;
     static bool registered = false;
     if (!registered) {
         WNDCLASSEXW wc = { sizeof(wc) };
@@ -469,10 +462,10 @@ static void EnsureOverlay() {
     }
     g_overlay = CreateWindowExW(WS_EX_NOACTIVATE, L"LayerPinningStrip", L"",
                                 WS_CHILD, 0, 0, 1, 1,
-                                g_host, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                HostWindow(), nullptr, GetModuleHandleW(nullptr), nullptr);
     g_cover   = CreateWindowExW(WS_EX_NOACTIVATE, L"LayerPinningCover", L"",
                                 WS_CHILD, 0, 0, 1, 1,
-                                g_host, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                HostWindow(), nullptr, GetModuleHandleW(nullptr), nullptr);
     if (g_overlay) SetTimer(g_overlay, kTimerId, kTimerMs, nullptr);
     LogF(L"overlay=%p cover=%p", (void*)g_overlay, (void*)g_cover);
 }
@@ -510,7 +503,7 @@ static void UpdateOverlayPlacement(int v) {
         return;
     }
     RECT cur = {}; GetWindowRect(g_overlay, &cur);
-    POINT tl = { strip.left, strip.top }; ClientToScreen(g_host, &tl);
+    POINT tl = { strip.left, strip.top }; ClientToScreen(HostWindow(), &tl);
     int w = strip.right - strip.left, h = strip.bottom - strip.top;
     if (cur.left != tl.x || cur.top != tl.y ||
         (cur.right - cur.left) != w || (cur.bottom - cur.top) != h) {
@@ -529,8 +522,7 @@ static void OnTick() {
     }
     if (!g_pStart) {
         if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
-        EDIT_INFO probe = {};
-        g_edit->get_edit_info(&probe, sizeof(probe));
+        const EDIT_INFO probe = EditInfo();
         if (probe.layer_max + 1 > probe.display_layer_num) EnsureStartPointerAsync();
         return;
     }
@@ -556,12 +548,11 @@ static void OnTick() {
             WriteIntSafe(g_pStart, g_userV);
             v = g_userV;
             RECT area;
-            if (LayerAreaRect(&area)) RedrawWindow(g_host, &area, nullptr, RDW_INVALIDATE);
+            if (LayerAreaRect(&area)) RedrawWindow(HostWindow(), &area, nullptr, RDW_INVALIDATE);
         }
     }
 
-    EDIT_INFO info = {};
-    g_edit->get_edit_info(&info, sizeof(info));
+    const EDIT_INFO info = EditInfo();
     if (info.display_frame_start != g_watch.frameStart ||
         info.frame               != g_watch.frame      ||
         info.display_layer_num   != g_watch.layerNum) {
@@ -627,11 +618,11 @@ static bool CoverLowerRegion() {
     const int w = lower.right - lower.left, h = lower.bottom - lower.top;
     if (w <= 0 || h <= 0) return false;
 
-    HDC wdc = GetDC(g_host);
+    HDC wdc = GetDC(HostWindow());
     if (!wdc) return false;
     bool ok = g_lowerCache.Ensure(wdc, w, h) &&
               BitBlt(g_lowerCache.dc, 0, 0, w, h, wdc, lower.left, lower.top, SRCCOPY) != 0;
-    ReleaseDC(g_host, wdc);
+    ReleaseDC(HostWindow(), wdc);
     if (!ok) return false;
 
     SetWindowPos(g_cover, HWND_TOP, lower.left, lower.top, w, h,
@@ -652,15 +643,15 @@ static void UncoverLowerRegion() {
         RECT lower = { area.left, strip.bottom, area.right, area.bottom };
         const int w = lower.right - lower.left, h = lower.bottom - lower.top;
         if (w == g_lowerCache.w && h == g_lowerCache.h) {
-            HDC wdc = GetDC(g_host);
+            HDC wdc = GetDC(HostWindow());
             if (wdc) {
                 BitBlt(wdc, lower.left, lower.top, w, h, g_lowerCache.dc, 0, 0, SRCCOPY);
-                ReleaseDC(g_host, wdc);
+                ReleaseDC(HostWindow(), wdc);
             }
         }
     }
     ShowWindow(g_cover, SW_HIDE);
-    if (LayerAreaRect(&area)) RedrawWindow(g_host, &area, nullptr, RDW_INVALIDATE);
+    if (LayerAreaRect(&area)) RedrawWindow(HostWindow(), &area, nullptr, RDW_INVALIDATE);
 }
 
 static bool PointInPinnedStrip(POINT ptClient) {
@@ -823,10 +814,10 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 static const wchar_t* MenuTextPin() {
-    return g_config ? g_config->translate(g_config, L"レイヤーを固定") : L"レイヤーを固定";
+    return Translate(L"レイヤーを固定");
 }
 static const wchar_t* MenuTextUnpin() {
-    return g_config ? g_config->translate(g_config, L"レイヤーの固定を解除") : L"レイヤーの固定を解除";
+    return Translate(L"レイヤーの固定を解除");
 }
 
 static void** FindIatSlot(HMODULE mod, const char* dll, const char* fn) {
@@ -892,15 +883,13 @@ static void RemoveIfEmptySubmenu(HMENU root, HMENU sub) {
 }
 
 static int LayerUnderCursor(int screenX, int screenY) {
-    if (!g_host) return -1;
+    if (!HostWindow()) return -1;
     if (!g_geo.valid) {
-        if (!g_edit) return -1;
-        EDIT_INFO info = {};
-        g_edit->get_edit_info(&info, sizeof(info));
-        return info.layer;
+        if (!Edit()) return -1;
+        return EditInfo().layer;
     }
     POINT pt = { screenX, screenY };
-    ScreenToClient(g_host, &pt);
+    ScreenToClient(HostWindow(), &pt);
     if (pt.x < g_geo.area.left || pt.x >= g_geo.contentRight) return -1;
     if (pt.y < g_geo.row0Top || pt.y >= g_geo.area.bottom) return -1;
 
@@ -914,11 +903,10 @@ static int LayerUnderCursor(int screenX, int screenY) {
 }
 
 static bool IsMenuEligible(int layer) {
-    if (layer < 0 || !g_edit) return false;
+    if (layer < 0 || !Edit()) return false;
     if (layer < g_pinCount) return true;
     if (layer != g_pinCount) return false;
-    EDIT_INFO info = {}; g_edit->get_edit_info(&info, sizeof(info));
-    return layer + 1 < info.display_layer_num;
+    return layer + 1 < EditInfo().display_layer_num;
 }
 
 typedef BOOL (WINAPI* TrackPopupMenu_t)(HMENU, UINT, int, int, int, HWND, const RECT*);
@@ -958,7 +946,7 @@ static BOOL WINAPI Hook_TrackPopupMenu(HMENU menu, UINT flags, int x, int y,
 #ifdef LP_DEBUG_LOG
     {
         int cur = -1; if (g_pStart) ReadIntSafe(g_pStart, &cur);
-        EDIT_INFO info = {}; if (g_edit) g_edit->get_edit_info(&info, sizeof(info));
+        const EDIT_INFO info = EditInfo();
         LogF(L"  MENU OPEN: pStart=%d hostLayer=%d ourLayer=%d",
              cur, info.layer, g_menuLayer);
     }
@@ -967,7 +955,7 @@ static BOOL WINAPI Hook_TrackPopupMenu(HMENU menu, UINT flags, int x, int y,
 #ifdef LP_DEBUG_LOG
     {
         int cur = -1; if (g_pStart) ReadIntSafe(g_pStart, &cur);
-        EDIT_INFO info = {}; if (g_edit) g_edit->get_edit_info(&info, sizeof(info));
+        const EDIT_INFO info = EditInfo();
         LogF(L"  MENU CLOSED: pStart=%d hostLayer=%d", cur, info.layer);
     }
 #endif
@@ -1006,7 +994,7 @@ static void ApplyPinChange(EDIT_SECTION* edit, bool wantPin) {
     if (g_pinCount > 0) EnsureStartPointerAsync();
     else if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
 
-    if (g_host) InvalidateRect(g_host, nullptr, FALSE);
+    if (HostWindow()) InvalidateRect(HostWindow(), nullptr, FALSE);
 }
 
 static void OnPinMenu(EDIT_SECTION* edit)   { ApplyPinChange(edit, true); }
@@ -1026,9 +1014,8 @@ static void OnChangeScene(EDIT_SECTION* edit) {
 static void OnAnyEvent(void*) {
     g_idleStreak = 0;
     RequestRefresh();
-    if (!g_edit) return;
-    EDIT_INFO info = {};
-    g_edit->get_edit_info(&info, sizeof(info));
+    if (!Edit()) return;
+    const EDIT_INFO info = EditInfo();
     if (info.display_layer_num != g_geo.displayLayerNum) {
         g_geo.displayLayerNum = info.display_layer_num;
         g_stripValid = false;
@@ -1046,12 +1033,12 @@ EXTERN_C __declspec(dllexport) COMMON_PLUGIN_TABLE* GetCommonPluginTable(void) {
 }
 EXTERN_C __declspec(dllexport) DWORD RequiredVersion() { return 2010000; }
 EXTERN_C __declspec(dllexport) void InitializeLogger(LOG_HANDLE* h) { SetLogHandle(h); }
-EXTERN_C __declspec(dllexport) void InitializeConfig(CONFIG_HANDLE* h) { g_config = h; }
+EXTERN_C __declspec(dllexport) void InitializeConfig(CONFIG_HANDLE* h) { SetConfigHandle(h); }
 EXTERN_C __declspec(dllexport) bool InitializePlugin(DWORD) { return true; }
 
 EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
-    g_edit = host->create_edit_handle();
-    g_host = g_edit->get_host_app_window();
+    SetEditHandle(host->create_edit_handle());
+    SetHostWindow(Edit()->get_host_app_window());
 
     host->register_layer_menu(MenuTextPin(), OnPinMenu);
     host->register_layer_menu(MenuTextUnpin(), OnUnpinMenu);
@@ -1061,19 +1048,19 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
     host->register_event_listener(EVENT_TYPE::CHANGE_FOCUS_OBJECT, nullptr, OnAnyEvent);
     host->register_event_listener(EVENT_TYPE::CHANGE_EDIT_SCENE,   nullptr, OnAnyEvent);
 
-    if (g_host)
-        g_origProc = (WNDPROC)SetWindowLongPtrW(g_host, GWLP_WNDPROC, (LONG_PTR)HostProc);
+    if (HostWindow())
+        g_origProc = (WNDPROC)SetWindowLongPtrW(HostWindow(), GWLP_WNDPROC, (LONG_PTR)HostProc);
 
     g_tpmSlot = FindIatSlot(GetModuleHandleW(nullptr), "USER32.dll", "TrackPopupMenu");
     if (g_tpmSlot) PatchSlot(g_tpmSlot, (void*)&Hook_TrackPopupMenu, (void**)&g_origTPM);
 
-    LogF(L"LayerPinning registered (host=%p tpmSlot=%p)", (void*)g_host, (void*)g_tpmSlot);
+    LogF(L"LayerPinning registered (host=%p tpmSlot=%p)", (void*)HostWindow(), (void*)g_tpmSlot);
 }
 
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
     if (g_tpmSlot && g_origTPM) PatchSlot(g_tpmSlot, (void*)g_origTPM, nullptr);
     if (g_overlay) { KillTimer(g_overlay, kTimerId); DestroyWindow(g_overlay); g_overlay = nullptr; }
-    if (g_host && g_origProc) SetWindowLongPtrW(g_host, GWLP_WNDPROC, (LONG_PTR)g_origProc);
+    if (HostWindow() && g_origProc) SetWindowLongPtrW(HostWindow(), GWLP_WNDPROC, (LONG_PTR)g_origProc);
     g_stripCache.Release();
     g_lowerCache.Release();
 }

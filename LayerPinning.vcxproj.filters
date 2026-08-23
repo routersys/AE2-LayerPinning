@@ -19,6 +19,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\HostContext.cpp">
+      <Filter>ソース ファイル</Filter>
+    </ClCompile>
     <ClCompile Include="src\LayerPinning.cpp">
       <Filter>ソース ファイル</Filter>
     </ClCompile>
@@ -33,6 +36,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\HostContext.h">
+      <Filter>ヘッダー ファイル</Filter>
+    </ClInclude>
     <ClInclude Include="src\Log.h">
       <Filter>ヘッダー ファイル</Filter>
     </ClInclude>
