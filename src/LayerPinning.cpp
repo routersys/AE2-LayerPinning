@@ -1,10 +1,10 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <vector>
-#include <unordered_map>
 
 #include "HostContext.h"
 #include "Log.h"
+#include "PinState.h"
 #include "PixelCache.h"
 #include "RefreshRequest.h"
 #include "SafeMemory.h"
@@ -14,10 +14,6 @@ using namespace lp;
 static HWND           g_overlay = nullptr;
 static HWND           g_cover   = nullptr;
 static WNDPROC        g_origProc = nullptr;
-
-static std::unordered_map<int, int> g_pinByScene;
-static int g_sceneId  = 0;
-static int g_pinCount = 0;
 
 static int* g_pStart = nullptr;
 static volatile LONG g_locating     = 0;
@@ -134,8 +130,8 @@ static bool LayerAreaRect(RECT* out) {
 }
 
 static int VisiblePinRows() {
-    if (g_pinCount <= 0) return 0;
-    int rows = g_pinCount;
+    if (PinCount() <= 0) return 0;
+    int rows = PinCount();
     if (g_geo.displayLayerNum > 1 && rows > g_geo.displayLayerNum - 1)
         rows = g_geo.displayLayerNum - 1;
     return rows > 0 ? rows : 0;
@@ -312,7 +308,7 @@ static unsigned long long HashStrip() {
 }
 
 static bool PinningActive() {
-    return g_pinCount > 0 && g_geo.valid && g_pStart != nullptr;
+    return PinCount() > 0 && g_geo.valid && g_pStart != nullptr;
 }
 
 static void UpdateOverlayPlacement(int v);
@@ -516,7 +512,7 @@ static void UpdateOverlayPlacement(int v) {
 static void OnTick() {
     if (g_menuRemap && GetTickCount64() >= g_menuRemapUntil) EndMenuRemap();
     if (g_remapping) return;
-    if (g_pinCount <= 0) {
+    if (PinCount() <= 0) {
         if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
         return;
     }
@@ -894,7 +890,7 @@ static int LayerUnderCursor(int screenX, int screenY) {
     if (pt.y < g_geo.row0Top || pt.y >= g_geo.area.bottom) return -1;
 
     int row = (pt.y - g_geo.row0Top) / g_geo.rowHeight;
-    if (g_pinCount > 0 && row < g_pinCount) return row;
+    if (PinCount() > 0 && row < PinCount()) return row;
 
     int start = 0;
     if (g_pStart) { if (!ReadIntSafe(g_pStart, &start)) start = ReadStartThroughSdk(); }
@@ -902,12 +898,6 @@ static int LayerUnderCursor(int screenX, int screenY) {
     return start + row;
 }
 
-static bool IsMenuEligible(int layer) {
-    if (layer < 0 || !Edit()) return false;
-    if (layer < g_pinCount) return true;
-    if (layer != g_pinCount) return false;
-    return layer + 1 < EditInfo().display_layer_num;
-}
 
 typedef BOOL (WINAPI* TrackPopupMenu_t)(HMENU, UINT, int, int, int, HWND, const RECT*);
 static TrackPopupMenu_t g_origTPM = nullptr;
@@ -926,7 +916,7 @@ static BOOL WINAPI Hook_TrackPopupMenu(HMENU menu, UINT flags, int x, int y,
         const int layer = LayerUnderCursor(x, y);
         g_menuLayer = layer;
         const bool eligible = IsMenuEligible(layer);
-        const bool pinned   = eligible && layer < g_pinCount;
+        const bool pinned   = eligible && layer < PinCount();
         const bool dropPin   = !eligible || pinned;
         const bool dropUnpin = !eligible || !pinned;
 
@@ -976,22 +966,15 @@ static void ApplyPinChange(EDIT_SECTION* edit, bool wantPin) {
     }
     if (layer < 0) return;
 
-    const int before = g_pinCount;
-    if (wantPin) {
-        if (layer != g_pinCount) return;
-        g_pinCount = layer + 1;
-    } else {
-        if (layer >= g_pinCount) return;
-        g_pinCount = layer;
-    }
+    const int before = PinCount();
+    if (!ApplyPin(layer, wantPin)) return;
 
-    g_pinByScene[g_sceneId] = g_pinCount;
     g_stripValid = false;
     RequestRefresh();
-    LogF(L"pinCount %d -> %d (layer %d, scene %d)", before, g_pinCount, layer, g_sceneId);
+    LogF(L"pinCount %d -> %d (layer %d, scene %d)", before, PinCount(), layer, SceneId());
 
     EnsureOverlay();
-    if (g_pinCount > 0) EnsureStartPointerAsync();
+    if (PinCount() > 0) EnsureStartPointerAsync();
     else if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
 
     if (HostWindow()) InvalidateRect(HostWindow(), nullptr, FALSE);
@@ -1001,14 +984,12 @@ static void OnPinMenu(EDIT_SECTION* edit)   { ApplyPinChange(edit, true); }
 static void OnUnpinMenu(EDIT_SECTION* edit) { ApplyPinChange(edit, false); }
 
 static void OnChangeScene(EDIT_SECTION* edit) {
-    g_sceneId = edit->info->scene_id;
-    auto it = g_pinByScene.find(g_sceneId);
-    g_pinCount = (it == g_pinByScene.end()) ? 0 : it->second;
+    SelectScene(edit->info->scene_id);
     g_pStart = nullptr;
     g_stripValid = false;
     RequestRefresh();
     ProbeGeometry(edit);
-    if (g_pinCount > 0) EnsureStartPointerAsync();
+    if (PinCount() > 0) EnsureStartPointerAsync();
 }
 
 static void OnAnyEvent(void*) {
