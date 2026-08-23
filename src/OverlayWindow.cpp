@@ -78,6 +78,7 @@ void OverlayWindow::Create(HWND parent) {
     hwnd_ = CreateWindowExW(WS_EX_NOACTIVATE, L"LayerPinningStrip", L"",
                             WS_CHILD, 0, 0, 1, 1,
                             parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    InterlockedExchange(&g_tickPosted, 0);
 }
 
 void OverlayWindow::StartTicking(void (*proc)()) {
