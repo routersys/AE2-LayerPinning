@@ -84,9 +84,10 @@ static void OnTick() {
         RequestRefresh();
     }
 
-    bool dirty = TakeRefreshRequest();
+    const bool urgent = TakeUrgentRefreshRequest();
+    bool dirty = TakeRefreshRequest() || urgent;
 
-    if (dirty && Overlay().Image().Valid()) {
+    if (dirty && !urgent && Overlay().Image().Valid()) {
         const double minGap = (double)kTickIntervalMs * Overlay().Image().IdleStreak();
         if (MillisecondsSinceLastRefresh() < minGap) {
             DeferRefreshRequest();
@@ -152,7 +153,7 @@ void OnChangeScene(EDIT_SECTION* edit) {
 
 void OnAnyEvent(void*) {
     Overlay().Image().ResetIdleStreak();
-    RequestRefresh();
+    RequestUrgentRefresh();
     if (!Edit()) return;
     const EDIT_INFO info = EditInfo();
     if (info.display_layer_num != DisplayLayerNum()) {

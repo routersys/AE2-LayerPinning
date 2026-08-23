@@ -61,7 +61,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COMMAND: {
             LRESULT r = CallHostWindowProc(hwnd, msg, wp, lp);
             EndMenuRemap();
-            RequestRefresh();
+            RequestUrgentRefresh();
             return r;
         }
 
