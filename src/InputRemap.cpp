@@ -3,6 +3,7 @@
 #include <windowsx.h>
 
 #include "CoverWindow.h"
+#include "DrawHook.h"
 #include "HostContext.h"
 #include "LayerGeometry.h"
 #include "Log.h"
@@ -19,6 +20,7 @@ static ULONGLONG g_holdUntil = 0;
 static const ULONGLONG kHoldMs = 400;
 static ULONGLONG g_coverUntil = 0;
 static bool      g_menuRemap = false;
+static bool      g_menuCovered = false;
 static int       g_menuRemapV = 0;
 static ULONGLONG g_menuRemapUntil = 0;
 static const ULONGLONG kMenuRemapMs = 4000;
@@ -39,7 +41,7 @@ LRESULT HandleContextMenu(HWND hwnd, WPARAM wp, LPARAM lp, bool* handled) {
     ScreenToClient(hwnd, &pt);
     if (!PointInPinnedStrip(pt)) return 0;
 
-    Cover().CoverLowerRegion();
+    g_menuCovered = !DrawHookActive() && Cover().CoverLowerRegion();
     g_remapping = true;
     g_menuRemap = true;
     g_menuRemapV = v;
@@ -58,7 +60,8 @@ void EndMenuRemap() {
     WriteStart(g_menuRemapV);
     g_userV = g_menuRemapV;
     g_holdUntil = GetTickCount64() + kHoldMs;
-    g_coverUntil = GetTickCount64() + kCoverMs;
+    if (g_menuCovered) g_coverUntil = GetTickCount64() + kCoverMs;
+    g_menuCovered = false;
     RequestRefresh();
 }
 
@@ -91,7 +94,7 @@ LRESULT HandleMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool* handled) {
 #endif
 
     const bool button = (msg != WM_MOUSEMOVE);
-    bool covered = button && Cover().CoverLowerRegion();
+    bool covered = button && !DrawHookActive() && Cover().CoverLowerRegion();
 
     g_remapping = true;
     WriteStart(0);

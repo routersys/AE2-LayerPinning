@@ -1,6 +1,7 @@
 #include "PinningController.h"
 
 #include "CoverWindow.h"
+#include "DrawHook.h"
 #include "HostContext.h"
 #include "InputRemap.h"
 #include "LayerGeometry.h"
@@ -43,6 +44,7 @@ static void EnsureOverlay() {
 static void OnTick() {
     ExpireMenuRemap();
     if (Remapping()) return;
+    KeepDrawHookArmed();
     if (PinCount() <= 0) {
         Overlay().Hide();
         return;
@@ -51,6 +53,11 @@ static void OnTick() {
         Overlay().Hide();
         const EDIT_INFO probe = EditInfo();
         if (probe.layer_max + 1 > probe.display_layer_num) EnsureStartPointerAsync();
+        return;
+    }
+    if (DrawHookActive()) {
+        ExpireCover();
+        Overlay().Hide();
         return;
     }
     if (!PinningActive()) {
@@ -126,6 +133,7 @@ static void ApplyPinChange(EDIT_SECTION* edit, bool wantPin) {
     EnsureOverlay();
     if (PinCount() > 0) EnsureStartPointerAsync();
     else Overlay().Hide();
+    KeepDrawHookArmed();
 
     if (HostWindow()) InvalidateRect(HostWindow(), nullptr, FALSE);
 }
@@ -144,6 +152,7 @@ void OnUnpinMenu(EDIT_SECTION* edit) { ApplyPinChange(edit, false); }
 
 void OnChangeScene(EDIT_SECTION* edit) {
     SelectScene(edit->info->scene_id);
+    ReleaseDrawHook();
     ResetStartPointer();
     Overlay().Image().Invalidate();
     RequestRefresh();

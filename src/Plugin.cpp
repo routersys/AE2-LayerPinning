@@ -1,5 +1,6 @@
 #include <windows.h>
 
+#include "DrawHook.h"
 #include "HostContext.h"
 #include "HostWindowHook.h"
 #include "LayerMenuHook.h"
@@ -41,6 +42,7 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 }
 
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
+    ReleaseDrawHook();
     UninstallLayerMenuHook();
     DestroyOverlay();
     UninstallHostWindowHook();
