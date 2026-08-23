@@ -15,43 +15,41 @@ static const unsigned char kLoopABytes[] = {
     0x48, 0x8b, 0x87, 0xd0, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x88, 0x50, 0x08,
     0x00, 0x00, 0x8b, 0x91, 0xc4, 0x01, 0x00, 0x00, 0x03, 0xd3, 0x48, 0x8b,
     0xcf, 0xe8, 0x61, 0x00, 0x00, 0x00, 0xff, 0xc3, 0x48, 0x8b, 0x87, 0xf0,
-    0x00, 0x00, 0x00, 0x3b, 0x98, 0x38, 0x05, 0x00, 0x00, 0x7c, 0xd1,
+    0x00, 0x00, 0x00, 0x3b, 0x98, 0x38, 0x05, 0x00, 0x00, 0x7c, 0xd1, 0x80,
+    0x7c, 0x24, 0x68, 0x00,
 };
 static const unsigned char kLoopCBytes[] = {
     0x48, 0x8b, 0x83, 0xd0, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x88, 0x50, 0x08,
     0x00, 0x00, 0x8b, 0x91, 0xc4, 0x01, 0x00, 0x00, 0x03, 0xd7, 0x48, 0x8b,
     0xcb, 0xe8, 0xe0, 0x00, 0x00, 0x00, 0xff, 0xc7, 0x48, 0x8b, 0x83, 0xf8,
-    0x00, 0x00, 0x00, 0x3b, 0xb8, 0x38, 0x05, 0x00, 0x00, 0x7c, 0xd1,
-};
-static const unsigned char kAutoScrollBytes[] = {
-    0x48, 0x8b, 0x83, 0xf0, 0x02, 0x00, 0x00, 0x48, 0x8b, 0x88, 0x50, 0x08,
-    0x00, 0x00, 0x8b, 0x91, 0xc4, 0x01, 0x00, 0x00, 0x44, 0x3b, 0xca, 0x7c,
-    0x0d, 0x8b, 0x8b, 0x38, 0x05, 0x00, 0x00, 0x03, 0xca, 0x44, 0x3b, 0xc9,
-    0x7e, 0x1c,
+    0x00, 0x00, 0x00, 0x3b, 0xb8, 0x38, 0x05, 0x00, 0x00, 0x7c, 0xd1, 0x83,
+    0xbb, 0x00, 0x03, 0x00, 0x00, 0x00,
 };
 
 static const unsigned long kLoopARva = 0x2f431;
+static const unsigned long kLoopAEndRva = 0x2f460;
 static const unsigned long kLoopCRva = 0x3d392;
-static const unsigned long kAutoScrollRva = 0x2c8aa;
-static const unsigned long kAutoScrollSigRva = 0x2c896;
+static const unsigned long kLoopCEndRva = 0x3d3c1;
 
 static const unsigned long long kRowCountOffset = 0x538;
 static const unsigned long long kLoopAInfoOffset = 0xf0;
 static const unsigned long long kLoopCInfoOffset = 0xf8;
 
-static const DWORD64 kSlotMask = 0x0fff003full;
-static const DWORD64 kSlotEnable = 0x15ull;
+static const DWORD64 kSlotMask = 0xffff00ffull;
+static const DWORD64 kSlotEnable = 0x55ull;
 static const ULONGLONG kWatchdogMs = 100;
 
 struct LoopState {
-    int baseV = 0;
+    int drawBase = 0;
+    int restore = 0;
     int pinnedRows = 0;
     bool live = false;
 };
 
 static const unsigned char* g_loopA = nullptr;
+static const unsigned char* g_loopAEnd = nullptr;
 static const unsigned char* g_loopC = nullptr;
-static const unsigned char* g_autoScroll = nullptr;
+static const unsigned char* g_loopCEnd = nullptr;
 
 static LoopState g_stateA;
 static LoopState g_stateC;
@@ -60,9 +58,15 @@ static PVOID g_veh = nullptr;
 static volatile LONG g_active = 0;
 static DWORD g_armedThread = 0;
 
-static int g_lastBase = 0;
-static volatile LONG g_leftZero = 0;
+static bool g_remapActive = false;
+static int g_remapBase = 0;
+
+static int g_lastRestore = 0;
+static volatile LONG g_inLoop = 0;
 static volatile ULONGLONG g_lastLoopAt = 0;
+
+void SetRemapBase(int value) { g_remapBase = value; g_remapActive = true; }
+void ClearRemapBase() { g_remapActive = false; }
 
 static bool ReadRowCount(DWORD64 object, unsigned long long infoOffset, int* out) {
     void* info = nullptr;
@@ -80,29 +84,27 @@ static int CapPinnedRows(int rows) {
 static void EnterRow(LoopState& state, int row, DWORD64 object, unsigned long long infoOffset) {
     if (row == 0) {
         state.live = false;
-        int v = 0, rows = 0;
-        if (!ReadStart(&v)) return;
+        int memory = 0, rows = 0;
+        if (!ReadStart(&memory)) return;
         if (!ReadRowCount(object, infoOffset, &rows)) return;
         if (rows <= 1) return;
-        state.baseV = v;
+        state.restore = memory;
+        state.drawBase = g_remapActive ? g_remapBase : memory;
         state.pinnedRows = CapPinnedRows(rows);
         state.live = true;
-        g_lastBase = v;
+        g_lastRestore = memory;
         g_lastLoopAt = GetTickCount64();
+        InterlockedExchange(&g_inLoop, 1);
     }
     if (!state.live) return;
-    const bool pinnedRow = row < state.pinnedRows;
-    WriteStart(pinnedRow ? 0 : state.baseV);
-    InterlockedExchange(&g_leftZero, pinnedRow ? 1 : 0);
+    WriteStart(row < state.pinnedRows ? 0 : state.drawBase);
 }
 
-static void EnterAutoScroll(CONTEXT* context) {
-    const int layer = (int)context->R9;
-    if (layer < 0) return;
-    int rows = 0;
-    if (!ReadIntSafe((const int*)(context->Rbx + kRowCountOffset), &rows)) return;
-    if (rows <= 1) return;
-    if (layer < CapPinnedRows(rows)) context->Rdx = 0;
+static void LeaveLoop(LoopState& state) {
+    if (!state.live) return;
+    state.live = false;
+    WriteStart(state.restore);
+    InterlockedExchange(&g_inLoop, 0);
 }
 
 static LONG CALLBACK DrawVeh(EXCEPTION_POINTERS* info) {
@@ -112,7 +114,8 @@ static LONG CALLBACK DrawVeh(EXCEPTION_POINTERS* info) {
     const unsigned char* at = (const unsigned char*)info->ExceptionRecord->ExceptionAddress;
     if (at == g_loopA) EnterRow(g_stateA, (int)context->Rbx, context->Rdi, kLoopAInfoOffset);
     else if (at == g_loopC) EnterRow(g_stateC, (int)context->Rdi, context->Rbx, kLoopCInfoOffset);
-    else if (at == g_autoScroll) EnterAutoScroll(context);
+    else if (at == g_loopAEnd) LeaveLoop(g_stateA);
+    else if (at == g_loopCEnd) LeaveLoop(g_stateC);
     else return EXCEPTION_CONTINUE_SEARCH;
     context->Dr6 = 0;
     context->EFlags |= 0x10000;
@@ -139,8 +142,9 @@ static bool WithThreadContext(DWORD threadId, bool (*apply)(CONTEXT*)) {
 
 static bool ApplyArm(CONTEXT* context) {
     context->Dr0 = (DWORD64)g_loopA;
-    context->Dr1 = (DWORD64)g_loopC;
-    context->Dr2 = (DWORD64)g_autoScroll;
+    context->Dr1 = (DWORD64)g_loopAEnd;
+    context->Dr2 = (DWORD64)g_loopC;
+    context->Dr3 = (DWORD64)g_loopCEnd;
     context->Dr6 = 0;
     context->Dr7 = (context->Dr7 & ~kSlotMask) | kSlotEnable;
     return true;
@@ -150,6 +154,7 @@ static bool ApplyDisarm(CONTEXT* context) {
     context->Dr0 = 0;
     context->Dr1 = 0;
     context->Dr2 = 0;
+    context->Dr3 = 0;
     context->Dr6 = 0;
     context->Dr7 &= ~kSlotMask;
     return true;
@@ -159,8 +164,9 @@ static bool g_armedNow = false;
 static bool ReadArmedState(CONTEXT* context) {
     g_armedNow = (context->Dr7 & kSlotEnable) == kSlotEnable &&
                  context->Dr0 == (DWORD64)g_loopA &&
-                 context->Dr1 == (DWORD64)g_loopC &&
-                 context->Dr2 == (DWORD64)g_autoScroll;
+                 context->Dr1 == (DWORD64)g_loopAEnd &&
+                 context->Dr2 == (DWORD64)g_loopC &&
+                 context->Dr3 == (DWORD64)g_loopCEnd;
     return false;
 }
 
@@ -177,12 +183,12 @@ bool DrawHookSupported() {
     checked = 1;
     result = ImageIsExpectedBuild() &&
              ImageBytesMatch(kLoopARva, kLoopABytes, sizeof(kLoopABytes)) &&
-             ImageBytesMatch(kLoopCRva, kLoopCBytes, sizeof(kLoopCBytes)) &&
-             ImageBytesMatch(kAutoScrollSigRva, kAutoScrollBytes, sizeof(kAutoScrollBytes));
+             ImageBytesMatch(kLoopCRva, kLoopCBytes, sizeof(kLoopCBytes));
     if (result) {
         g_loopA = ImageBase() + kLoopARva;
+        g_loopAEnd = ImageBase() + kLoopAEndRva;
         g_loopC = ImageBase() + kLoopCRva;
-        g_autoScroll = ImageBase() + kAutoScrollRva;
+        g_loopCEnd = ImageBase() + kLoopCEndRva;
         LogF(L"レイヤー固定: 本体に直接描かせる方式を使えます");
     } else {
         LogF(L"レイヤー固定: 本体の版が一致しないので取得方式で動きます");
@@ -193,11 +199,13 @@ bool DrawHookSupported() {
 bool DrawHookActive() { return g_active != 0; }
 
 static void RunWatchdog() {
-    if (!g_leftZero) return;
+    if (!g_inLoop) return;
     if (GetTickCount64() - g_lastLoopAt < kWatchdogMs) return;
+    g_stateA.live = false;
+    g_stateC.live = false;
+    InterlockedExchange(&g_inLoop, 0);
     int current = 0;
-    if (ReadStart(&current) && current == 0 && g_lastBase != 0) WriteStart(g_lastBase);
-    InterlockedExchange(&g_leftZero, 0);
+    if (ReadStart(&current) && current != g_lastRestore) WriteStart(g_lastRestore);
 }
 
 void KeepDrawHookArmed() {
@@ -228,10 +236,10 @@ void ReleaseDrawHook() {
         g_armedThread = 0;
         g_stateA.live = false;
         g_stateC.live = false;
-        if (g_leftZero) {
+        if (g_inLoop) {
+            InterlockedExchange(&g_inLoop, 0);
             int current = 0;
-            if (ReadStart(&current) && current == 0 && g_lastBase != 0) WriteStart(g_lastBase);
-            InterlockedExchange(&g_leftZero, 0);
+            if (ReadStart(&current) && current != g_lastRestore) WriteStart(g_lastRestore);
         }
     }
     if (g_veh) {
