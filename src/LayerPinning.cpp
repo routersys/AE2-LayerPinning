@@ -14,6 +14,7 @@ static CONFIG_HANDLE* g_config  = nullptr;
 static HWND           g_host    = nullptr;
 static HWND           g_overlay = nullptr;
 static HWND           g_cover   = nullptr;
+static WNDPROC        g_origProc = nullptr;
 
 static std::unordered_map<int, int> g_pinByScene;
 static int g_sceneId  = 0;
@@ -24,9 +25,20 @@ static volatile LONG g_locating     = 0;
 static volatile LONG g_suppressPaint = 0;
 static volatile LONG g_dirty        = 1;
 static volatile LONG g_refreshing   = 0;
+static bool g_remapping = false;
 
 static int   g_lastV      = -1;
 static ULONGLONG g_lastRefresh = 0;
+
+static int       g_userV     = 0;
+static ULONGLONG g_holdUntil = 0;
+static const ULONGLONG kHoldMs = 400;
+static ULONGLONG g_coverUntil = 0;
+static bool      g_menuRemap = false;
+static int       g_menuRemapV = 0;
+static ULONGLONG g_menuRemapUntil = 0;
+static const ULONGLONG kMenuRemapMs = 4000;
+static const ULONGLONG kCoverMs = 150;
 
 static const UINT_PTR kTimerId = 0x4C500001;
 static const UINT     kTimerMs = 33;
@@ -370,6 +382,8 @@ static bool PinningActive() {
 }
 
 static void UpdateOverlayPlacement(int v);
+static void UncoverLowerRegion();
+static void EndMenuRemap();
 
 static void WaitForHostToFinishDrawing(const RECT& rc) {
     const int w = rc.right - rc.left, h = rc.bottom - rc.top;
@@ -566,6 +580,8 @@ static void UpdateOverlayPlacement(int v) {
 }
 
 static void OnTick() {
+    if (g_menuRemap && GetTickCount64() >= g_menuRemapUntil) EndMenuRemap();
+    if (g_remapping) return;
     if (g_pinCount <= 0) {
         if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
         return;
@@ -584,11 +600,36 @@ static void OnTick() {
     int v = 0;
     if (!ReadIntSafe(g_pStart, &v)) return;
 
+    if (g_coverUntil && GetTickCount64() >= g_coverUntil) {
+        g_coverUntil = 0;
+        UncoverLowerRegion();
+    }
+
+    if (g_holdUntil) {
+        if (GetTickCount64() >= g_holdUntil) {
+            g_holdUntil = 0;
+        } else if (v != g_userV) {
+#ifdef LP_DEBUG_LOG
+            LogF(L"  hold: host moved %d -> restoring %d", v, g_userV);
+#endif
+            WriteIntSafe(g_pStart, g_userV);
+            v = g_userV;
+            RECT area;
+            if (LayerAreaRect(&area)) RedrawWindow(g_host, &area, nullptr, RDW_INVALIDATE);
+        }
+    }
+
     EDIT_INFO info = {};
     g_edit->get_edit_info(&info, sizeof(info));
     if (info.display_frame_start != g_watch.frameStart ||
         info.frame               != g_watch.frame      ||
         info.display_layer_num   != g_watch.layerNum) {
+#ifdef LP_DEBUG_LOG
+        LogF(L"  watch changed: frameStart %d->%d frame %d->%d layerNum %d->%d",
+             g_watch.frameStart, info.display_frame_start,
+             g_watch.frame, info.frame,
+             g_watch.layerNum, info.display_layer_num);
+#endif
         g_watch.frameStart = info.display_frame_start;
         g_watch.frame      = info.frame;
         if (info.display_layer_num != g_watch.layerNum) {
@@ -610,7 +651,7 @@ static void OnTick() {
     }
     if (!g_stripValid) dirty = true;
 
-    if (dirty && !g_locating) RefreshStrip();
+    if (dirty && !g_locating && !g_coverUntil) RefreshStrip();
     else if (dirty) InterlockedExchange(&g_dirty, 1);
     if (v != g_lastV) g_lastV = v;
     UpdateOverlayPlacement(v);
@@ -635,6 +676,209 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             break;
     }
     return DefWindowProcW(h, m, wp, lp);
+}
+
+static bool CoverLowerRegion() {
+    if (!g_cover || !g_geo.valid) return false;
+    RECT area, strip;
+    if (!LayerAreaRect(&area) || !PinnedStripRect(&strip)) return false;
+    RECT lower = { area.left, strip.bottom, area.right, area.bottom };
+    const int w = lower.right - lower.left, h = lower.bottom - lower.top;
+    if (w <= 0 || h <= 0) return false;
+
+    HDC wdc = GetDC(g_host);
+    if (!wdc) return false;
+    bool ok = g_lowerCache.Ensure(wdc, w, h) &&
+              BitBlt(g_lowerCache.dc, 0, 0, w, h, wdc, lower.left, lower.top, SRCCOPY) != 0;
+    ReleaseDC(g_host, wdc);
+    if (!ok) return false;
+
+    SetWindowPos(g_cover, HWND_TOP, lower.left, lower.top, w, h,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    ShowWindow(g_cover, SW_SHOWNOACTIVATE);
+    UpdateWindow(g_cover);
+#ifdef LP_DEBUG_LOG
+    LogF(L"  COVER on (%d,%d %dx%d) visible=%d", lower.left, lower.top, w, h,
+         (int)IsWindowVisible(g_cover));
+#endif
+    return true;
+}
+
+static void UncoverLowerRegion() {
+    if (!g_cover) return;
+    RECT area, strip;
+    if (LayerAreaRect(&area) && PinnedStripRect(&strip) && g_lowerCache.dc) {
+        RECT lower = { area.left, strip.bottom, area.right, area.bottom };
+        const int w = lower.right - lower.left, h = lower.bottom - lower.top;
+        if (w == g_lowerCache.w && h == g_lowerCache.h) {
+            HDC wdc = GetDC(g_host);
+            if (wdc) {
+                BitBlt(wdc, lower.left, lower.top, w, h, g_lowerCache.dc, 0, 0, SRCCOPY);
+                ReleaseDC(g_host, wdc);
+            }
+        }
+    }
+    ShowWindow(g_cover, SW_HIDE);
+    if (LayerAreaRect(&area)) RedrawWindow(g_host, &area, nullptr, RDW_INVALIDATE);
+}
+
+static bool PointInPinnedStrip(POINT ptClient) {
+    RECT strip;
+    if (!PinnedStripRect(&strip)) return false;
+    return PtInRect(&strip, ptClient) != 0;
+}
+static bool CursorInPinnedStrip(LPARAM lp) {
+    POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+    return PointInPinnedStrip(pt);
+}
+
+static LRESULT HandleContextMenu(HWND hwnd, WPARAM wp, LPARAM lp, bool* handled) {
+    *handled = false;
+    if (!PinningActive()) return 0;
+    int v;
+    if (!ReadIntSafe(g_pStart, &v) || v <= 0) return 0;
+
+    POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+    if (lp == (LPARAM)-1 || (pt.x == -1 && pt.y == -1)) GetCursorPos(&pt);
+    ScreenToClient(hwnd, &pt);
+    if (!PointInPinnedStrip(pt)) return 0;
+
+    CoverLowerRegion();
+    g_remapping = true;
+    g_menuRemap = true;
+    g_menuRemapV = v;
+    g_menuRemapUntil = GetTickCount64() + kMenuRemapMs;
+    WriteIntSafe(g_pStart, 0);
+    LRESULT r = CallWindowProcW(g_origProc, hwnd, WM_CONTEXTMENU, wp, lp);
+    *handled = true;
+    return r;
+}
+
+static void EndMenuRemap() {
+    if (!g_menuRemap) return;
+    g_menuRemap = false;
+    g_menuRemapUntil = 0;
+    g_remapping = false;
+    WriteIntSafe(g_pStart, g_menuRemapV);
+    g_userV = g_menuRemapV;
+    g_holdUntil = GetTickCount64() + kHoldMs;
+    g_coverUntil = GetTickCount64() + kCoverMs;
+    InterlockedExchange(&g_dirty, 1);
+}
+
+static LRESULT HandleMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool* handled) {
+    *handled = false;
+#ifdef LP_NO_REMAP
+    return 0;
+#endif
+    if (!PinningActive()) return 0;
+    int v;
+    if (!ReadIntSafe(g_pStart, &v)) return 0;
+    if (v <= 0) return 0;
+    if (!CursorInPinnedStrip(lp)) return 0;
+
+#ifdef LP_DEBUG_LOG
+    if (msg != WM_MOUSEMOVE)
+        LogF(L"  REMAP msg=0x%04X at (%d,%d) v=%d", msg,
+             GET_X_LPARAM(lp), GET_Y_LPARAM(lp), v);
+#endif
+
+    const bool button = (msg != WM_MOUSEMOVE);
+    bool covered = button && CoverLowerRegion();
+
+    g_remapping = true;
+    WriteIntSafe(g_pStart, 0);
+    LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
+    WriteIntSafe(g_pStart, v);
+    g_remapping = false;
+
+    g_userV = v;
+    g_holdUntil = GetTickCount64() + kHoldMs;
+
+    if (covered) g_coverUntil = GetTickCount64() + kCoverMs;
+    *handled = true;
+    return r;
+}
+
+static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_PAINT:
+            if (g_suppressPaint) {
+                PAINTSTRUCT ps; BeginPaint(hwnd, &ps); EndPaint(hwnd, &ps);
+                return 0;
+            }
+            break;
+
+        case WM_SIZE:
+        case WM_DPICHANGED: {
+            LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
+            g_stripCache.Release();
+            g_lowerCache.Release();
+            g_stripValid = false;
+            InterlockedExchange(&g_dirty, 1);
+            RequestProbeGeometry();
+            return r;
+        }
+
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+        case WM_CAPTURECHANGED: {
+            const bool onScrollBar = g_geo.valid && GET_X_LPARAM(lp) >= g_geo.contentRight;
+            const bool dragging = (wp & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) != 0;
+            if (!onScrollBar && (msg != WM_MOUSEMOVE || dragging || CursorInPinnedStrip(lp))) {
+                if (msg != WM_MOUSEMOVE) g_idleStreak = 0;
+                InterlockedExchange(&g_dirty, 1);
+            }
+            bool handled = false;
+            LRESULT r = HandleMouse(hwnd, msg, wp, lp, &handled);
+            if (handled) return r;
+            break;
+        }
+
+        case WM_CONTEXTMENU: {
+            bool handled = false;
+            LRESULT r = HandleContextMenu(hwnd, wp, lp, &handled);
+            InterlockedExchange(&g_dirty, 1);
+            if (handled) return r;
+            break;
+        }
+
+        case WM_COMMAND: {
+            LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
+            EndMenuRemap();
+            InterlockedExchange(&g_dirty, 1);
+            return r;
+        }
+
+        case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+        case WM_KEYDOWN: case WM_KEYUP: case WM_CHAR:
+            if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL ||
+                msg == WM_KEYDOWN || msg == WM_KEYUP)
+                g_holdUntil = 0;
+            InterlockedExchange(&g_dirty, 1);
+            break;
+
+        case WM_DESTROY:
+            if (g_overlay) { KillTimer(g_overlay, kTimerId); DestroyWindow(g_overlay); g_overlay = nullptr; }
+            if (g_cover) { DestroyWindow(g_cover); g_cover = nullptr; }
+            g_stripCache.Release();
+            g_lowerCache.Release();
+            break;
+    }
+
+    LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
+
+    if (g_holdUntil && g_pStart) {
+        if (GetTickCount64() >= g_holdUntil) {
+            g_holdUntil = 0;
+        } else {
+            int cur;
+            if (ReadIntSafe(g_pStart, &cur) && cur != g_userV) WriteIntSafe(g_pStart, g_userV);
+        }
+    }
+    return r;
 }
 
 static const wchar_t* MenuTextPin() {
@@ -876,6 +1120,9 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
     host->register_event_listener(EVENT_TYPE::CHANGE_FOCUS_OBJECT, nullptr, OnAnyEvent);
     host->register_event_listener(EVENT_TYPE::CHANGE_EDIT_SCENE,   nullptr, OnAnyEvent);
 
+    if (g_host)
+        g_origProc = (WNDPROC)SetWindowLongPtrW(g_host, GWLP_WNDPROC, (LONG_PTR)HostProc);
+
     g_tpmSlot = FindIatSlot(GetModuleHandleW(nullptr), "USER32.dll", "TrackPopupMenu");
     if (g_tpmSlot) PatchSlot(g_tpmSlot, (void*)&Hook_TrackPopupMenu, (void**)&g_origTPM);
 
@@ -885,6 +1132,7 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
     if (g_tpmSlot && g_origTPM) PatchSlot(g_tpmSlot, (void*)g_origTPM, nullptr);
     if (g_overlay) { KillTimer(g_overlay, kTimerId); DestroyWindow(g_overlay); g_overlay = nullptr; }
+    if (g_host && g_origProc) SetWindowLongPtrW(g_host, GWLP_WNDPROC, (LONG_PTR)g_origProc);
     g_stripCache.Release();
     g_lowerCache.Release();
 }
