@@ -103,6 +103,7 @@
     <ClCompile Include="src\RefreshRequest.cpp" />
     <ClCompile Include="src\SafeMemory.cpp" />
     <ClCompile Include="src\ScrollAnchor.cpp" />
+    <ClCompile Include="src\StripCapture.cpp" />
   </ItemGroup>
 
   <ItemGroup>
@@ -117,6 +118,7 @@
     <ClInclude Include="src\RefreshRequest.h" />
     <ClInclude Include="src\SafeMemory.h" />
     <ClInclude Include="src\ScrollAnchor.h" />
+    <ClInclude Include="src\StripCapture.h" />
   </ItemGroup>
 
   <ItemGroup>
