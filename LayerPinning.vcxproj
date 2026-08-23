@@ -94,10 +94,12 @@
   <ItemGroup>
     <ClCompile Include="src\LayerPinning.cpp" />
     <ClCompile Include="src\Log.cpp" />
+    <ClCompile Include="src\SafeMemory.cpp" />
   </ItemGroup>
 
   <ItemGroup>
     <ClInclude Include="src\Log.h" />
+    <ClInclude Include="src\SafeMemory.h" />
   </ItemGroup>
 
   <ItemGroup>
