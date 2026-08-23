@@ -5,6 +5,6 @@
 namespace lp {
 
 bool RefreshStrip();
-ULONGLONG LastRefreshTick();
+double MillisecondsSinceLastRefresh();
 
 }

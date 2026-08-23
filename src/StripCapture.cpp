@@ -16,9 +16,16 @@ static const double kDrawDeadlineMs = 12.0;
 static const double kDrawSettleMs = 4.0;
 
 static volatile LONG g_refreshing   = 0;
-static ULONGLONG g_lastRefresh = 0;
+static LARGE_INTEGER g_freq = {};
+static double g_lastRefreshAt = 0.0;
 
-ULONGLONG LastRefreshTick() { return g_lastRefresh; }
+static double NowMs() {
+    if (!g_freq.QuadPart) QueryPerformanceFrequency(&g_freq);
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / g_freq.QuadPart;
+}
+
+double MillisecondsSinceLastRefresh() { return NowMs() - g_lastRefreshAt; }
 
 static void ForceHostRepaint(const RECT& rc) {
     RedrawWindow(HostWindow(), &rc, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
@@ -70,6 +77,7 @@ static void WaitForHostToFinishDrawing(const RECT& rc) {
 bool RefreshStrip() {
     if (!PinningActive()) return false;
     if (InterlockedCompareExchange(&g_refreshing, 1, 0) != 0) return false;
+    g_lastRefreshAt = NowMs();
 #ifdef LP_DEBUG_LOG
     LARGE_INTEGER t_begin; QueryPerformanceCounter(&t_begin);
 #endif
@@ -128,7 +136,6 @@ bool RefreshStrip() {
                  (int)ok, v, (double)(t1.QuadPart - t_begin.QuadPart) * 1000.0 / f.QuadPart);
     }
 #endif
-    g_lastRefresh = GetTickCount64();
     InterlockedExchange(&g_refreshing, 0);
     return ok;
 }

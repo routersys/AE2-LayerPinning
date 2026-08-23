@@ -82,8 +82,8 @@ static void OnTick() {
     bool dirty = TakeRefreshRequest();
 
     if (dirty && Overlay().Image().Valid()) {
-        const ULONGLONG minGap = (ULONGLONG)kTickIntervalMs * (1 + Overlay().Image().IdleStreak());
-        if (GetTickCount64() - LastRefreshTick() < minGap) {
+        const double minGap = (double)kTickIntervalMs * Overlay().Image().IdleStreak();
+        if (MillisecondsSinceLastRefresh() < minGap) {
             RequestRefresh();
             dirty = false;
         }
