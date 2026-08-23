@@ -101,7 +101,10 @@ bool RefreshStrip() {
                 Overlay().UpdatePlacement(OverlayShouldShow(v));
                 if (Overlay().Image().Changed()) Overlay().RepaintIfVisible();
             }
-            if (covered) Cover().Hide();
+            if (covered) {
+                ForceHostRepaint(area);
+                Cover().Hide();
+            }
         }
     }
 #ifdef LP_DEBUG_LOG
