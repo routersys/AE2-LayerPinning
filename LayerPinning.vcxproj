@@ -92,6 +92,7 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
+    <ClCompile Include="src\CoverWindow.cpp" />
     <ClCompile Include="src\HostContext.cpp" />
     <ClCompile Include="src\LayerGeometry.cpp" />
     <ClCompile Include="src\LayerPinning.cpp" />
@@ -104,6 +105,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ClInclude Include="src\CoverWindow.h" />
     <ClInclude Include="src\HostContext.h" />
     <ClInclude Include="src\LayerGeometry.h" />
     <ClInclude Include="src\Log.h" />

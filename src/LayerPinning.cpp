@@ -2,18 +2,17 @@
 #include <windowsx.h>
 #include <vector>
 
+#include "CoverWindow.h"
 #include "HostContext.h"
 #include "LayerGeometry.h"
 #include "Log.h"
 #include "OverlayWindow.h"
 #include "PinState.h"
-#include "PixelCache.h"
 #include "RefreshRequest.h"
 #include "ScrollAnchor.h"
 
 using namespace lp;
 
-static HWND           g_cover   = nullptr;
 static WNDPROC        g_origProc = nullptr;
 
 static volatile LONG g_refreshing   = 0;
@@ -40,14 +39,12 @@ struct WatchedState {
 };
 static WatchedState g_watch;
 
-static PixelCache g_lowerCache;
 static bool PinningActive() {
     return PinCount() > 0 && GeometryValid() && HasStartPointer();
 }
 
 static bool OverlayShouldShow(int v);
 static void OnTick();
-static void UncoverLowerRegion();
 static void EndMenuRemap();
 
 static void WaitForHostToFinishDrawing(const RECT& rc) {
@@ -99,16 +96,10 @@ static bool RefreshStrip() {
         if (wdc) {
             const bool needSwap = (v != 0);
             const RECT lower = LowerRegionRect(area, strip);
-            const int lw = lower.right - lower.left, lh = lower.bottom - lower.top;
             bool covered = false;
 
-            if (needSwap && g_cover && lw > 0 && lh > 0 &&
-                g_lowerCache.Ensure(wdc, lw, lh) &&
-                BitBlt(g_lowerCache.dc, 0, 0, lw, lh, wdc, lower.left, lower.top, SRCCOPY)) {
-                SetWindowPos(g_cover, HWND_TOP, lower.left, lower.top, lw, lh,
-                             SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-                ShowWindow(g_cover, SW_SHOWNOACTIVATE);
-                UpdateWindow(g_cover);
+            if (needSwap && Cover().Capture(wdc, lower)) {
+                Cover().Place(lower);
                 covered = true;
             }
 
@@ -125,7 +116,7 @@ static bool RefreshStrip() {
 
             if (needSwap) {
                 WriteStart(v);
-                if (covered) BitBlt(wdc, lower.left, lower.top, lw, lh, g_lowerCache.dc, 0, 0, SRCCOPY);
+                if (covered) Cover().Restore(wdc, lower);
                 else RedrawWindow(HostWindow(), &area, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
             }
             ReleaseDC(HostWindow(), wdc);
@@ -136,7 +127,7 @@ static bool RefreshStrip() {
                 Overlay().UpdatePlacement(OverlayShouldShow(v));
                 if (Overlay().Image().Changed()) Overlay().RepaintIfVisible();
             }
-            if (covered) ShowWindow(g_cover, SW_HIDE);
+            if (covered) Cover().Hide();
         }
     }
 #ifdef LP_DEBUG_LOG
@@ -153,52 +144,12 @@ static bool RefreshStrip() {
     return ok;
 }
 
-static LRESULT CALLBACK CoverProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
-
-static void EnsureCover() {
-    if (g_cover || !HostWindow()) return;
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSEXW wc = { sizeof(wc) };
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.hCursor   = LoadCursorW(nullptr, IDC_ARROW);
-        wc.lpfnWndProc   = CoverProc;
-        wc.lpszClassName = L"LayerPinningCover";
-        RegisterClassExW(&wc);
-        registered = true;
-    }
-    g_cover = CreateWindowExW(WS_EX_NOACTIVATE, L"LayerPinningCover", L"",
-                              WS_CHILD, 0, 0, 1, 1,
-                              HostWindow(), nullptr, GetModuleHandleW(nullptr), nullptr);
-}
-
 static void EnsureOverlay() {
     if (Overlay().Hwnd() || !HostWindow()) return;
     Overlay().Create(HostWindow());
-    EnsureCover();
+    Cover().Create(HostWindow());
     Overlay().StartTicking(OnTick);
-    LogF(L"overlay=%p cover=%p", (void*)Overlay().Hwnd(), (void*)g_cover);
-}
-
-static LRESULT CALLBACK CoverProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
-    switch (m) {
-        case WM_NCHITTEST:  return HTTRANSPARENT;
-        case WM_ERASEBKGND: return 1;
-        case WM_PAINT: {
-            PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
-            RECT rc; GetClientRect(h, &rc);
-#ifdef LP_DEBUG_COVER
-            HBRUSH br = CreateSolidBrush(RGB(255, 0, 255));
-            FillRect(dc, &rc, br); DeleteObject(br);
-#else
-            if (g_lowerCache.dc)
-                BitBlt(dc, 0, 0, rc.right, rc.bottom, g_lowerCache.dc, 0, 0, SRCCOPY);
-#endif
-            EndPaint(h, &ps);
-            return 0;
-        }
-    }
-    return DefWindowProcW(h, m, wp, lp);
+    LogF(L"overlay=%p cover=%p", (void*)Overlay().Hwnd(), (void*)Cover().Hwnd());
 }
 
 static bool OverlayShouldShow(int v) {
@@ -227,7 +178,7 @@ static void OnTick() {
 
     if (g_coverUntil && GetTickCount64() >= g_coverUntil) {
         g_coverUntil = 0;
-        UncoverLowerRegion();
+        Cover().UncoverLowerRegion();
     }
 
     if (g_holdUntil) {
@@ -281,49 +232,6 @@ static void OnTick() {
     Overlay().UpdatePlacement(OverlayShouldShow(v));
 }
 
-static bool CoverLowerRegion() {
-    if (!g_cover || !GeometryValid()) return false;
-    RECT lower;
-    if (!LowerRegionRect(&lower)) return false;
-    const int w = lower.right - lower.left, h = lower.bottom - lower.top;
-    if (w <= 0 || h <= 0) return false;
-
-    HDC wdc = GetDC(HostWindow());
-    if (!wdc) return false;
-    bool ok = g_lowerCache.Ensure(wdc, w, h) &&
-              BitBlt(g_lowerCache.dc, 0, 0, w, h, wdc, lower.left, lower.top, SRCCOPY) != 0;
-    ReleaseDC(HostWindow(), wdc);
-    if (!ok) return false;
-
-    SetWindowPos(g_cover, HWND_TOP, lower.left, lower.top, w, h,
-                 SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-    ShowWindow(g_cover, SW_SHOWNOACTIVATE);
-    UpdateWindow(g_cover);
-#ifdef LP_DEBUG_LOG
-    LogF(L"  COVER on (%d,%d %dx%d) visible=%d", lower.left, lower.top, w, h,
-         (int)IsWindowVisible(g_cover));
-#endif
-    return true;
-}
-
-static void UncoverLowerRegion() {
-    if (!g_cover) return;
-    RECT lower;
-    if (LowerRegionRect(&lower) && g_lowerCache.dc) {
-        const int w = lower.right - lower.left, h = lower.bottom - lower.top;
-        if (w == g_lowerCache.w && h == g_lowerCache.h) {
-            HDC wdc = GetDC(HostWindow());
-            if (wdc) {
-                BitBlt(wdc, lower.left, lower.top, w, h, g_lowerCache.dc, 0, 0, SRCCOPY);
-                ReleaseDC(HostWindow(), wdc);
-            }
-        }
-    }
-    ShowWindow(g_cover, SW_HIDE);
-    RECT area;
-    if (LayerAreaRect(&area)) RedrawWindow(HostWindow(), &area, nullptr, RDW_INVALIDATE);
-}
-
 static LRESULT HandleContextMenu(HWND hwnd, WPARAM wp, LPARAM lp, bool* handled) {
     *handled = false;
     if (!PinningActive()) return 0;
@@ -335,7 +243,7 @@ static LRESULT HandleContextMenu(HWND hwnd, WPARAM wp, LPARAM lp, bool* handled)
     ScreenToClient(hwnd, &pt);
     if (!PointInPinnedStrip(pt)) return 0;
 
-    CoverLowerRegion();
+    Cover().CoverLowerRegion();
     g_remapping = true;
     g_menuRemap = true;
     g_menuRemapV = v;
@@ -376,7 +284,7 @@ static LRESULT HandleMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool* hand
 #endif
 
     const bool button = (msg != WM_MOUSEMOVE);
-    bool covered = button && CoverLowerRegion();
+    bool covered = button && Cover().CoverLowerRegion();
 
     g_remapping = true;
     WriteStart(0);
@@ -405,7 +313,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DPICHANGED: {
             LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
             Overlay().Image().Release();
-            g_lowerCache.Release();
+            Cover().ReleaseCache();
             Overlay().Image().Invalidate();
             RequestRefresh();
             RequestProbeGeometry();
@@ -454,9 +362,9 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_DESTROY:
             Overlay().Destroy();
-            if (g_cover) { DestroyWindow(g_cover); g_cover = nullptr; }
+            Cover().Destroy();
             Overlay().Image().Release();
-            g_lowerCache.Release();
+            Cover().ReleaseCache();
             break;
     }
 
@@ -687,7 +595,7 @@ EXTERN_C __declspec(dllexport) void UninitializePlugin() {
     Overlay().Destroy();
     if (HostWindow() && g_origProc) SetWindowLongPtrW(HostWindow(), GWLP_WNDPROC, (LONG_PTR)g_origProc);
     Overlay().Image().Release();
-    g_lowerCache.Release();
+    Cover().ReleaseCache();
 }
 
 BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
