@@ -41,7 +41,7 @@ LRESULT HandleContextMenu(HWND hwnd, WPARAM wp, LPARAM lp, bool* handled) {
     ScreenToClient(hwnd, &pt);
     if (!PointInPinnedStrip(pt)) return 0;
 
-    g_menuCovered = !DrawHookActive() && Cover().CoverLowerRegion();
+    g_menuCovered = Cover().CoverLowerRegion();
     g_remapping = true;
     g_menuRemap = true;
     g_menuRemapV = v;
@@ -97,9 +97,11 @@ LRESULT HandleMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool* handled) {
     bool covered = button && !DrawHookActive() && Cover().CoverLowerRegion();
 
     g_remapping = true;
+    SetRemapBase(v);
     WriteStart(0);
     LRESULT r = CallHostWindowProc(hwnd, msg, wp, lp);
     WriteStart(v);
+    ClearRemapBase();
     g_remapping = false;
 
     g_userV = v;
