@@ -5,14 +5,21 @@ namespace lp {
 static EDIT_HANDLE*   g_edit   = nullptr;
 static CONFIG_HANDLE* g_config = nullptr;
 static HWND           g_host   = nullptr;
+static WNDPROC        g_hostProc = nullptr;
 
 void SetEditHandle(EDIT_HANDLE* handle) { g_edit = handle; }
 void SetConfigHandle(CONFIG_HANDLE* handle) { g_config = handle; }
 void SetHostWindow(HWND window) { g_host = window; }
+void SetHostWindowProc(WNDPROC proc) { g_hostProc = proc; }
 
 EDIT_HANDLE* Edit() { return g_edit; }
 CONFIG_HANDLE* Config() { return g_config; }
 HWND HostWindow() { return g_host; }
+WNDPROC HostWindowProc() { return g_hostProc; }
+
+LRESULT CallHostWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    return CallWindowProcW(g_hostProc, hwnd, msg, wp, lp);
+}
 
 EDIT_INFO EditInfo() {
     EDIT_INFO info = {};

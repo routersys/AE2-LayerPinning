@@ -15,8 +15,6 @@
 
 using namespace lp;
 
-static WNDPROC        g_origProc = nullptr;
-
 static bool g_remapping = false;
 
 static int   g_lastV      = -1;
@@ -143,7 +141,7 @@ static LRESULT HandleContextMenu(HWND hwnd, WPARAM wp, LPARAM lp, bool* handled)
     g_menuRemapV = v;
     g_menuRemapUntil = GetTickCount64() + kMenuRemapMs;
     WriteStart(0);
-    LRESULT r = CallWindowProcW(g_origProc, hwnd, WM_CONTEXTMENU, wp, lp);
+    LRESULT r = CallHostWindowProc(hwnd, WM_CONTEXTMENU, wp, lp);
     *handled = true;
     return r;
 }
@@ -182,7 +180,7 @@ static LRESULT HandleMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool* hand
 
     g_remapping = true;
     WriteStart(0);
-    LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
+    LRESULT r = CallHostWindowProc(hwnd, msg, wp, lp);
     WriteStart(v);
     g_remapping = false;
 
@@ -205,7 +203,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_SIZE:
         case WM_DPICHANGED: {
-            LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
+            LRESULT r = CallHostWindowProc(hwnd, msg, wp, lp);
             Overlay().Image().Release();
             Cover().ReleaseCache();
             Overlay().Image().Invalidate();
@@ -240,7 +238,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_COMMAND: {
-            LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
+            LRESULT r = CallHostWindowProc(hwnd, msg, wp, lp);
             EndMenuRemap();
             RequestRefresh();
             return r;
@@ -262,7 +260,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
     }
 
-    LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
+    LRESULT r = CallHostWindowProc(hwnd, msg, wp, lp);
 
     if (g_holdUntil && HasStartPointer()) {
         if (GetTickCount64() >= g_holdUntil) {
@@ -476,7 +474,7 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
     host->register_event_listener(EVENT_TYPE::CHANGE_EDIT_SCENE,   nullptr, OnAnyEvent);
 
     if (HostWindow())
-        g_origProc = (WNDPROC)SetWindowLongPtrW(HostWindow(), GWLP_WNDPROC, (LONG_PTR)HostProc);
+        SetHostWindowProc((WNDPROC)SetWindowLongPtrW(HostWindow(), GWLP_WNDPROC, (LONG_PTR)HostProc));
 
     g_tpmSlot = FindIatSlot(GetModuleHandleW(nullptr), "USER32.dll", "TrackPopupMenu");
     if (g_tpmSlot) PatchSlot(g_tpmSlot, (void*)&Hook_TrackPopupMenu, (void**)&g_origTPM);
@@ -487,7 +485,8 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
     if (g_tpmSlot && g_origTPM) PatchSlot(g_tpmSlot, (void*)g_origTPM, nullptr);
     Overlay().Destroy();
-    if (HostWindow() && g_origProc) SetWindowLongPtrW(HostWindow(), GWLP_WNDPROC, (LONG_PTR)g_origProc);
+    if (HostWindow() && HostWindowProc())
+        SetWindowLongPtrW(HostWindow(), GWLP_WNDPROC, (LONG_PTR)HostWindowProc());
     Overlay().Image().Release();
     Cover().ReleaseCache();
 }
