@@ -12,6 +12,9 @@
 
 namespace lp {
 
+static const double kDrawDeadlineMs = 12.0;
+static const double kDrawSettleMs = 4.0;
+
 static volatile LONG g_refreshing   = 0;
 static ULONGLONG g_lastRefresh = 0;
 
@@ -37,19 +40,28 @@ static void WaitForHostToFinishDrawing(const RECT& rc) {
     bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
     std::vector<BYTE> prev((size_t)w * lines * 4), cur(prev.size());
 
-    const ULONGLONG deadline = GetTickCount64() + 12;
-    int stable = 0;
+    LARGE_INTEGER freq, begin, tick;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&begin);
+    double stableSince = -1.0;
     bool first = true;
-    while (GetTickCount64() < deadline && stable < 2) {
+    for (;;) {
+        QueryPerformanceCounter(&tick);
+        const double elapsed = (double)(tick.QuadPart - begin.QuadPart) * 1000.0 / freq.QuadPart;
+        if (elapsed >= kDrawDeadlineMs) break;
         BitBlt(mdc, 0, 0, w, h, wdc, rc.left, rc.top, SRCCOPY);
         SelectObject(mdc, old);
         GetDIBits(mdc, bmp, startLine, lines, cur.data(), &bi, DIB_RGB_COLORS);
         SelectObject(mdc, bmp);
-        if (!first && memcmp(cur.data(), prev.data(), cur.size()) == 0) stable++;
-        else stable = 0;
+        if (!first && memcmp(cur.data(), prev.data(), cur.size()) == 0) {
+            if (stableSince < 0.0) stableSince = elapsed;
+            if (elapsed - stableSince >= kDrawSettleMs) break;
+        } else {
+            stableSince = -1.0;
+        }
         prev.swap(cur);
         first = false;
-        if (stable < 2) Sleep(1);
+        SwitchToThread();
     }
     SelectObject(mdc, old);
     DeleteObject(bmp); DeleteDC(mdc); ReleaseDC(HostWindow(), wdc);
