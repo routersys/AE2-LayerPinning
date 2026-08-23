@@ -99,6 +99,7 @@
 
   <ItemGroup>
     <ClInclude Include="src\Log.h" />
+    <ClInclude Include="src\PixelCache.h" />
     <ClInclude Include="src\SafeMemory.h" />
   </ItemGroup>
 

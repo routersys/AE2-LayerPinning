@@ -33,6 +33,9 @@
     <ClInclude Include="src\Log.h">
       <Filter>ヘッダー ファイル</Filter>
     </ClInclude>
+    <ClInclude Include="src\PixelCache.h">
+      <Filter>ヘッダー ファイル</Filter>
+    </ClInclude>
     <ClInclude Include="src\SafeMemory.h">
       <Filter>ヘッダー ファイル</Filter>
     </ClInclude>
