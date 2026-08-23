@@ -17,6 +17,10 @@ static ULONGLONG g_lastRefresh = 0;
 
 ULONGLONG LastRefreshTick() { return g_lastRefresh; }
 
+static void ForceHostRepaint(const RECT& rc) {
+    RedrawWindow(HostWindow(), &rc, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+}
+
 static void WaitForHostToFinishDrawing(const RECT& rc) {
     const int w = rc.right - rc.left, h = rc.bottom - rc.top;
     if (w <= 0 || h <= 0) return;
@@ -78,7 +82,7 @@ bool RefreshStrip() {
 
             if (needSwap) {
                 WriteStart(0);
-                RedrawWindow(HostWindow(), &strip, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+                ForceHostRepaint(strip);
                 WaitForHostToFinishDrawing(strip);
             }
 
@@ -87,7 +91,7 @@ bool RefreshStrip() {
             if (needSwap) {
                 WriteStart(v);
                 if (covered) Cover().Restore(wdc, lower);
-                else RedrawWindow(HostWindow(), &area, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+                else ForceHostRepaint(area);
             }
             ReleaseDC(HostWindow(), wdc);
 
