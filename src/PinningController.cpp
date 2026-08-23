@@ -27,11 +27,16 @@ static WatchedState g_watch;
 
 static void OnTick();
 
+static void WakeTick() {
+    Overlay().RequestTick();
+}
+
 static void EnsureOverlay() {
     if (Overlay().Hwnd() || !HostWindow()) return;
     Overlay().Create(HostWindow());
     Cover().Create(HostWindow());
     Overlay().StartTicking(OnTick);
+    SetRefreshWaker(WakeTick);
     LogF(L"overlay=%p cover=%p", (void*)Overlay().Hwnd(), (void*)Cover().Hwnd());
 }
 
@@ -84,14 +89,14 @@ static void OnTick() {
     if (dirty && Overlay().Image().Valid()) {
         const double minGap = (double)kTickIntervalMs * Overlay().Image().IdleStreak();
         if (MillisecondsSinceLastRefresh() < minGap) {
-            RequestRefresh();
+            DeferRefreshRequest();
             dirty = false;
         }
     }
     if (!Overlay().Image().Valid()) dirty = true;
 
     if (dirty && !Locating() && !CoverHeld()) RefreshStrip();
-    else if (dirty) RequestRefresh();
+    else if (dirty) DeferRefreshRequest();
     if (v != g_lastV) g_lastV = v;
     Overlay().UpdatePlacement(OverlayShouldShow(v));
 }

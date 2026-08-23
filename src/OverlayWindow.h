@@ -36,6 +36,7 @@ class OverlayWindow {
 public:
     void Create(HWND parent);
     void StartTicking(void (*proc)());
+    void RequestTick();
     void Destroy();
 
     HWND Hwnd() const { return hwnd_; }

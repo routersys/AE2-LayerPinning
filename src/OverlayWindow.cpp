@@ -6,6 +6,9 @@
 namespace lp {
 
 static const UINT_PTR kTimerId = 0x4C500001;
+static const UINT kTickNowMessage = WM_APP + 1;
+
+static volatile LONG g_tickPosted = 0;
 
 static OverlayWindow g_overlay;
 
@@ -82,6 +85,12 @@ void OverlayWindow::StartTicking(void (*proc)()) {
     if (hwnd_) SetTimer(hwnd_, kTimerId, kTickIntervalMs, nullptr);
 }
 
+void OverlayWindow::RequestTick() {
+    if (!hwnd_) return;
+    if (InterlockedCompareExchange(&g_tickPosted, 1, 0) != 0) return;
+    if (!PostMessageW(hwnd_, kTickNowMessage, 0, 0)) InterlockedExchange(&g_tickPosted, 0);
+}
+
 void OverlayWindow::Destroy() {
     if (hwnd_) { KillTimer(hwnd_, kTimerId); DestroyWindow(hwnd_); hwnd_ = nullptr; }
 }
@@ -138,6 +147,10 @@ LRESULT CALLBACK OverlayWindow::Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             EndPaint(h, &ps);
             return 0;
         }
+        case kTickNowMessage:
+            InterlockedExchange(&g_tickPosted, 0);
+            if (g_overlay.tick_) g_overlay.tick_();
+            return 0;
         case WM_TIMER:
             if (wp == kTimerId) { if (g_overlay.tick_) g_overlay.tick_(); return 0; }
             break;

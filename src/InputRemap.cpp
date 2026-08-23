@@ -103,6 +103,7 @@ LRESULT HandleMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool* handled) {
     g_holdUntil = GetTickCount64() + kHoldMs;
 
     if (covered) g_coverUntil = GetTickCount64() + kCoverMs;
+    RequestRefresh();
     *handled = true;
     return r;
 }
