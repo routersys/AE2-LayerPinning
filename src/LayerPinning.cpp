@@ -5,6 +5,7 @@
 #include "HostContext.h"
 #include "LayerGeometry.h"
 #include "Log.h"
+#include "OverlayWindow.h"
 #include "PinState.h"
 #include "PixelCache.h"
 #include "RefreshRequest.h"
@@ -12,7 +13,6 @@
 
 using namespace lp;
 
-static HWND           g_overlay = nullptr;
 static HWND           g_cover   = nullptr;
 static WNDPROC        g_origProc = nullptr;
 
@@ -32,9 +32,6 @@ static ULONGLONG g_menuRemapUntil = 0;
 static const ULONGLONG kMenuRemapMs = 4000;
 static const ULONGLONG kCoverMs = 150;
 
-static const UINT_PTR kTimerId = 0x4C500001;
-static const UINT     kTimerMs = 33;
-
 struct WatchedState {
     int frameStart = -1;
     int frameNum   = -1;
@@ -43,39 +40,13 @@ struct WatchedState {
 };
 static WatchedState g_watch;
 
-static PixelCache g_stripCache;
 static PixelCache g_lowerCache;
-static bool g_stripValid = false;
-
-static unsigned long long g_stripHash = 0;
-static int  g_idleStreak = 0;
-static bool g_stripChanged = false;
-static std::vector<BYTE> g_hashBuf;
-
-static unsigned long long HashStrip() {
-    if (!g_stripCache.dc || !g_stripCache.bmp || !g_stripCache.old) return 0;
-    const int w = g_stripCache.w, h = g_stripCache.h;
-    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    g_hashBuf.resize((size_t)w * h * 4);
-
-    SelectObject(g_stripCache.dc, g_stripCache.old);
-    int got = GetDIBits(g_stripCache.dc, g_stripCache.bmp, 0, h,
-                        g_hashBuf.data(), &bi, DIB_RGB_COLORS);
-    SelectObject(g_stripCache.dc, g_stripCache.bmp);
-    if (!got) return 0;
-
-    unsigned long long v = 1469598103934665603ULL;
-    for (size_t i = 0; i < g_hashBuf.size(); i += 8) { v ^= g_hashBuf[i]; v *= 1099511628211ULL; }
-    return v;
-}
-
 static bool PinningActive() {
     return PinCount() > 0 && GeometryValid() && HasStartPointer();
 }
 
-static void UpdateOverlayPlacement(int v);
+static bool OverlayShouldShow(int v);
+static void OnTick();
 static void UncoverLowerRegion();
 static void EndMenuRemap();
 
@@ -121,11 +92,9 @@ static bool RefreshStrip() {
 #endif
 
     bool ok = false;
-    g_stripChanged = false;
     RECT area, strip;
     int v = 0;
     if (LayerAreaRect(&area) && PinnedStripRect(&strip) && ReadStart(&v)) {
-        const int sw = strip.right - strip.left, sh = strip.bottom - strip.top;
         HDC wdc = GetDC(HostWindow());
         if (wdc) {
             const bool needSwap = (v != 0);
@@ -143,8 +112,8 @@ static bool RefreshStrip() {
                 covered = true;
             }
 
-            const bool hideOverlay = needSwap && g_overlay && IsWindowVisible(g_overlay);
-            if (hideOverlay) ShowWindow(g_overlay, SW_HIDE);
+            const bool hideOverlay = needSwap && Overlay().Visible();
+            if (hideOverlay) Overlay().Hide();
 
             if (needSwap) {
                 WriteStart(0);
@@ -152,20 +121,7 @@ static bool RefreshStrip() {
                 WaitForHostToFinishDrawing(strip);
             }
 
-            if (g_stripCache.Ensure(wdc, sw, sh))
-                ok = BitBlt(g_stripCache.dc, 0, 0, sw, sh, wdc, strip.left, strip.top, SRCCOPY) != 0;
-
-            if (ok) {
-                const unsigned long long hash = HashStrip();
-                if (g_stripValid && hash == g_stripHash) {
-                    if (g_idleStreak < 8) g_idleStreak++;
-                } else {
-                    g_stripHash = hash;
-                    g_idleStreak = 0;
-                    g_stripChanged = true;
-                }
-                g_stripValid = true;
-            }
+            ok = Overlay().Image().Refresh(wdc, strip);
 
             if (needSwap) {
                 WriteStart(v);
@@ -175,15 +131,10 @@ static bool RefreshStrip() {
             ReleaseDC(HostWindow(), wdc);
 
             if (hideOverlay) {
-                InvalidateRect(g_overlay, nullptr, FALSE);
-                ShowWindow(g_overlay, SW_SHOWNOACTIVATE);
-                UpdateWindow(g_overlay);
+                Overlay().ShowRepainted();
             } else {
-                UpdateOverlayPlacement(v);
-                if (g_stripChanged && g_overlay && IsWindowVisible(g_overlay)) {
-                    InvalidateRect(g_overlay, nullptr, FALSE);
-                    UpdateWindow(g_overlay);
-                }
+                Overlay().UpdatePlacement(OverlayShouldShow(v));
+                if (Overlay().Image().Changed()) Overlay().RepaintIfVisible();
             }
             if (covered) ShowWindow(g_cover, SW_HIDE);
         }
@@ -202,32 +153,31 @@ static bool RefreshStrip() {
     return ok;
 }
 
-static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
 static LRESULT CALLBACK CoverProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
 
-static void EnsureOverlay() {
-    if (g_overlay || !HostWindow()) return;
+static void EnsureCover() {
+    if (g_cover || !HostWindow()) return;
     static bool registered = false;
     if (!registered) {
         WNDCLASSEXW wc = { sizeof(wc) };
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.hCursor   = LoadCursorW(nullptr, IDC_ARROW);
-        wc.lpfnWndProc   = OverlayProc;
-        wc.lpszClassName = L"LayerPinningStrip";
-        RegisterClassExW(&wc);
         wc.lpfnWndProc   = CoverProc;
         wc.lpszClassName = L"LayerPinningCover";
         RegisterClassExW(&wc);
         registered = true;
     }
-    g_overlay = CreateWindowExW(WS_EX_NOACTIVATE, L"LayerPinningStrip", L"",
-                                WS_CHILD, 0, 0, 1, 1,
-                                HostWindow(), nullptr, GetModuleHandleW(nullptr), nullptr);
-    g_cover   = CreateWindowExW(WS_EX_NOACTIVATE, L"LayerPinningCover", L"",
-                                WS_CHILD, 0, 0, 1, 1,
-                                HostWindow(), nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (g_overlay) SetTimer(g_overlay, kTimerId, kTimerMs, nullptr);
-    LogF(L"overlay=%p cover=%p", (void*)g_overlay, (void*)g_cover);
+    g_cover = CreateWindowExW(WS_EX_NOACTIVATE, L"LayerPinningCover", L"",
+                              WS_CHILD, 0, 0, 1, 1,
+                              HostWindow(), nullptr, GetModuleHandleW(nullptr), nullptr);
+}
+
+static void EnsureOverlay() {
+    if (Overlay().Hwnd() || !HostWindow()) return;
+    Overlay().Create(HostWindow());
+    EnsureCover();
+    Overlay().StartTicking(OnTick);
+    LogF(L"overlay=%p cover=%p", (void*)Overlay().Hwnd(), (void*)g_cover);
 }
 
 static LRESULT CALLBACK CoverProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
@@ -252,42 +202,24 @@ static LRESULT CALLBACK CoverProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 }
 
 static bool OverlayShouldShow(int v) {
-    return PinningActive() && g_stripValid && v > 0;
-}
-
-static void UpdateOverlayPlacement(int v) {
-    if (!g_overlay) return;
-    RECT strip;
-    if (!OverlayShouldShow(v) || !PinnedStripRect(&strip)) {
-        if (IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
-        return;
-    }
-    RECT cur = {}; GetWindowRect(g_overlay, &cur);
-    POINT tl = { strip.left, strip.top }; ClientToScreen(HostWindow(), &tl);
-    int w = strip.right - strip.left, h = strip.bottom - strip.top;
-    if (cur.left != tl.x || cur.top != tl.y ||
-        (cur.right - cur.left) != w || (cur.bottom - cur.top) != h) {
-        SetWindowPos(g_overlay, HWND_TOP, strip.left, strip.top, w, h,
-                     SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-    }
-    if (!IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_SHOWNOACTIVATE);
+    return PinningActive() && Overlay().Image().Valid() && v > 0;
 }
 
 static void OnTick() {
     if (g_menuRemap && GetTickCount64() >= g_menuRemapUntil) EndMenuRemap();
     if (g_remapping) return;
     if (PinCount() <= 0) {
-        if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
+        Overlay().Hide();
         return;
     }
     if (!HasStartPointer()) {
-        if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
+        Overlay().Hide();
         const EDIT_INFO probe = EditInfo();
         if (probe.layer_max + 1 > probe.display_layer_num) EnsureStartPointerAsync();
         return;
     }
     if (!PinningActive()) {
-        if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
+        Overlay().Hide();
         return;
     }
     int v = 0;
@@ -327,47 +259,26 @@ static void OnTick() {
         if (info.display_layer_num != g_watch.layerNum) {
             g_watch.layerNum = info.display_layer_num;
             SetDisplayLayerNum(info.display_layer_num);
-            g_stripValid = false;
+            Overlay().Image().Invalidate();
         }
         RequestRefresh();
     }
 
     bool dirty = TakeRefreshRequest();
 
-    if (dirty && g_stripValid) {
-        const ULONGLONG minGap = (ULONGLONG)kTimerMs * (1 + g_idleStreak);
+    if (dirty && Overlay().Image().Valid()) {
+        const ULONGLONG minGap = (ULONGLONG)kTickIntervalMs * (1 + Overlay().Image().IdleStreak());
         if (GetTickCount64() - g_lastRefresh < minGap) {
             RequestRefresh();
             dirty = false;
         }
     }
-    if (!g_stripValid) dirty = true;
+    if (!Overlay().Image().Valid()) dirty = true;
 
     if (dirty && !Locating() && !g_coverUntil) RefreshStrip();
     else if (dirty) RequestRefresh();
     if (v != g_lastV) g_lastV = v;
-    UpdateOverlayPlacement(v);
-}
-
-static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
-    switch (m) {
-        case WM_NCHITTEST:
-            return HTTRANSPARENT;
-        case WM_ERASEBKGND:
-            return 1;
-        case WM_PAINT: {
-            PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
-            RECT rc; GetClientRect(h, &rc);
-            if (g_stripValid && g_stripCache.dc)
-                BitBlt(dc, 0, 0, rc.right, rc.bottom, g_stripCache.dc, 0, 0, SRCCOPY);
-            EndPaint(h, &ps);
-            return 0;
-        }
-        case WM_TIMER:
-            if (wp == kTimerId) { OnTick(); return 0; }
-            break;
-    }
-    return DefWindowProcW(h, m, wp, lp);
+    Overlay().UpdatePlacement(OverlayShouldShow(v));
 }
 
 static bool CoverLowerRegion() {
@@ -493,9 +404,9 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SIZE:
         case WM_DPICHANGED: {
             LRESULT r = CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
-            g_stripCache.Release();
+            Overlay().Image().Release();
             g_lowerCache.Release();
-            g_stripValid = false;
+            Overlay().Image().Invalidate();
             RequestRefresh();
             RequestProbeGeometry();
             return r;
@@ -509,7 +420,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const bool onScrollBar = GeometryValid() && GET_X_LPARAM(lp) >= ContentRight();
             const bool dragging = (wp & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) != 0;
             if (!onScrollBar && (msg != WM_MOUSEMOVE || dragging || CursorInPinnedStrip(lp))) {
-                if (msg != WM_MOUSEMOVE) g_idleStreak = 0;
+                if (msg != WM_MOUSEMOVE) Overlay().Image().ResetIdleStreak();
                 RequestRefresh();
             }
             bool handled = false;
@@ -542,9 +453,9 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
 
         case WM_DESTROY:
-            if (g_overlay) { KillTimer(g_overlay, kTimerId); DestroyWindow(g_overlay); g_overlay = nullptr; }
+            Overlay().Destroy();
             if (g_cover) { DestroyWindow(g_cover); g_cover = nullptr; }
-            g_stripCache.Release();
+            Overlay().Image().Release();
             g_lowerCache.Release();
             break;
     }
@@ -702,13 +613,13 @@ static void ApplyPinChange(EDIT_SECTION* edit, bool wantPin) {
     const int before = PinCount();
     if (!ApplyPin(layer, wantPin)) return;
 
-    g_stripValid = false;
+    Overlay().Image().Invalidate();
     RequestRefresh();
     LogF(L"pinCount %d -> %d (layer %d, scene %d)", before, PinCount(), layer, SceneId());
 
     EnsureOverlay();
     if (PinCount() > 0) EnsureStartPointerAsync();
-    else if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
+    else Overlay().Hide();
 
     if (HostWindow()) InvalidateRect(HostWindow(), nullptr, FALSE);
 }
@@ -719,20 +630,20 @@ static void OnUnpinMenu(EDIT_SECTION* edit) { ApplyPinChange(edit, false); }
 static void OnChangeScene(EDIT_SECTION* edit) {
     SelectScene(edit->info->scene_id);
     ResetStartPointer();
-    g_stripValid = false;
+    Overlay().Image().Invalidate();
     RequestRefresh();
     ProbeGeometry(edit);
     if (PinCount() > 0) EnsureStartPointerAsync();
 }
 
 static void OnAnyEvent(void*) {
-    g_idleStreak = 0;
+    Overlay().Image().ResetIdleStreak();
     RequestRefresh();
     if (!Edit()) return;
     const EDIT_INFO info = EditInfo();
     if (info.display_layer_num != DisplayLayerNum()) {
         SetDisplayLayerNum(info.display_layer_num);
-        g_stripValid = false;
+        Overlay().Image().Invalidate();
         RequestProbeGeometry();
     }
 }
@@ -773,9 +684,9 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
     if (g_tpmSlot && g_origTPM) PatchSlot(g_tpmSlot, (void*)g_origTPM, nullptr);
-    if (g_overlay) { KillTimer(g_overlay, kTimerId); DestroyWindow(g_overlay); g_overlay = nullptr; }
+    Overlay().Destroy();
     if (HostWindow() && g_origProc) SetWindowLongPtrW(HostWindow(), GWLP_WNDPROC, (LONG_PTR)g_origProc);
-    g_stripCache.Release();
+    Overlay().Image().Release();
     g_lowerCache.Release();
 }
 
