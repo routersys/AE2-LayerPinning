@@ -12,6 +12,8 @@ static EDIT_HANDLE*   g_edit    = nullptr;
 static LOG_HANDLE*    g_log     = nullptr;
 static CONFIG_HANDLE* g_config  = nullptr;
 static HWND           g_host    = nullptr;
+static HWND           g_overlay = nullptr;
+static HWND           g_cover   = nullptr;
 
 static std::unordered_map<int, int> g_pinByScene;
 static int g_sceneId  = 0;
@@ -21,6 +23,21 @@ static int* g_pStart = nullptr;
 static volatile LONG g_locating     = 0;
 static volatile LONG g_suppressPaint = 0;
 static volatile LONG g_dirty        = 1;
+static volatile LONG g_refreshing   = 0;
+
+static int   g_lastV      = -1;
+static ULONGLONG g_lastRefresh = 0;
+
+static const UINT_PTR kTimerId = 0x4C500001;
+static const UINT     kTimerMs = 33;
+
+struct WatchedState {
+    int frameStart = -1;
+    int frameNum   = -1;
+    int frame      = -1;
+    int layerNum   = -1;
+};
+static WatchedState g_watch;
 
 static void LogF(const wchar_t* fmt, ...) {
     wchar_t buf[1024];
@@ -299,6 +316,327 @@ static void EnsureStartPointerAsync() {
                  nullptr, 0, nullptr);
 }
 
+struct PixelCache {
+    HDC dc = nullptr; HBITMAP bmp = nullptr; HGDIOBJ old = nullptr;
+    int w = 0, h = 0;
+    bool Ensure(HDC ref, int cw, int ch) {
+        if (cw <= 0 || ch <= 0) return false;
+        if (dc && w == cw && h == ch) return true;
+        Release();
+        dc = CreateCompatibleDC(ref);
+        if (!dc) return false;
+        bmp = CreateCompatibleBitmap(ref, cw, ch);
+        if (!bmp) { DeleteDC(dc); dc = nullptr; return false; }
+        old = SelectObject(dc, bmp);
+        w = cw; h = ch;
+        return true;
+    }
+    void Release() {
+        if (dc) { if (old) SelectObject(dc, old); DeleteDC(dc); dc = nullptr; }
+        if (bmp) { DeleteObject(bmp); bmp = nullptr; }
+        old = nullptr; w = h = 0;
+    }
+};
+static PixelCache g_stripCache;
+static PixelCache g_lowerCache;
+static bool g_stripValid = false;
+
+static unsigned long long g_stripHash = 0;
+static int  g_idleStreak = 0;
+static bool g_stripChanged = false;
+static std::vector<BYTE> g_hashBuf;
+
+static unsigned long long HashStrip() {
+    if (!g_stripCache.dc || !g_stripCache.bmp || !g_stripCache.old) return 0;
+    const int w = g_stripCache.w, h = g_stripCache.h;
+    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    g_hashBuf.resize((size_t)w * h * 4);
+
+    SelectObject(g_stripCache.dc, g_stripCache.old);
+    int got = GetDIBits(g_stripCache.dc, g_stripCache.bmp, 0, h,
+                        g_hashBuf.data(), &bi, DIB_RGB_COLORS);
+    SelectObject(g_stripCache.dc, g_stripCache.bmp);
+    if (!got) return 0;
+
+    unsigned long long v = 1469598103934665603ULL;
+    for (size_t i = 0; i < g_hashBuf.size(); i += 8) { v ^= g_hashBuf[i]; v *= 1099511628211ULL; }
+    return v;
+}
+
+static bool PinningActive() {
+    return g_pinCount > 0 && g_geo.valid && g_pStart != nullptr;
+}
+
+static void UpdateOverlayPlacement(int v);
+
+static void WaitForHostToFinishDrawing(const RECT& rc) {
+    const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+    HDC wdc = GetDC(g_host);
+    if (!wdc) return;
+    HDC mdc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, w, h);
+    HGDIOBJ old = SelectObject(mdc, bmp);
+    const int probeLines = 8;
+    const int startLine = (h > probeLines) ? (h - probeLines) / 2 : 0;
+    const int lines = (h < probeLines) ? h : probeLines;
+    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = h;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    std::vector<BYTE> prev((size_t)w * lines * 4), cur(prev.size());
+
+    const ULONGLONG deadline = GetTickCount64() + 12;
+    int stable = 0;
+    bool first = true;
+    while (GetTickCount64() < deadline && stable < 2) {
+        BitBlt(mdc, 0, 0, w, h, wdc, rc.left, rc.top, SRCCOPY);
+        SelectObject(mdc, old);
+        GetDIBits(mdc, bmp, startLine, lines, cur.data(), &bi, DIB_RGB_COLORS);
+        SelectObject(mdc, bmp);
+        if (!first && memcmp(cur.data(), prev.data(), cur.size()) == 0) stable++;
+        else stable = 0;
+        prev.swap(cur);
+        first = false;
+        if (stable < 2) Sleep(1);
+    }
+    SelectObject(mdc, old);
+    DeleteObject(bmp); DeleteDC(mdc); ReleaseDC(g_host, wdc);
+}
+
+static bool RefreshStrip() {
+    if (!PinningActive()) return false;
+    if (InterlockedCompareExchange(&g_refreshing, 1, 0) != 0) return false;
+#ifdef LP_DEBUG_LOG
+    LARGE_INTEGER t_begin; QueryPerformanceCounter(&t_begin);
+#endif
+
+    bool ok = false;
+    g_stripChanged = false;
+    RECT area, strip;
+    int v = 0;
+    if (LayerAreaRect(&area) && PinnedStripRect(&strip) && ReadIntSafe(g_pStart, &v)) {
+        const int sw = strip.right - strip.left, sh = strip.bottom - strip.top;
+        HDC wdc = GetDC(g_host);
+        if (wdc) {
+            const bool needSwap = (v != 0);
+            RECT lower = { area.left, strip.bottom, area.right, area.bottom };
+            const int lw = lower.right - lower.left, lh = lower.bottom - lower.top;
+            bool covered = false;
+
+            if (needSwap && g_cover && lw > 0 && lh > 0 &&
+                g_lowerCache.Ensure(wdc, lw, lh) &&
+                BitBlt(g_lowerCache.dc, 0, 0, lw, lh, wdc, lower.left, lower.top, SRCCOPY)) {
+                SetWindowPos(g_cover, HWND_TOP, lower.left, lower.top, lw, lh,
+                             SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                ShowWindow(g_cover, SW_SHOWNOACTIVATE);
+                UpdateWindow(g_cover);
+                covered = true;
+            }
+
+            const bool hideOverlay = needSwap && g_overlay && IsWindowVisible(g_overlay);
+            if (hideOverlay) ShowWindow(g_overlay, SW_HIDE);
+
+            if (needSwap) {
+                WriteIntSafe(g_pStart, 0);
+                RedrawWindow(g_host, &strip, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+                WaitForHostToFinishDrawing(strip);
+            }
+
+            if (g_stripCache.Ensure(wdc, sw, sh))
+                ok = BitBlt(g_stripCache.dc, 0, 0, sw, sh, wdc, strip.left, strip.top, SRCCOPY) != 0;
+
+            if (ok) {
+                const unsigned long long hash = HashStrip();
+                if (g_stripValid && hash == g_stripHash) {
+                    if (g_idleStreak < 8) g_idleStreak++;
+                } else {
+                    g_stripHash = hash;
+                    g_idleStreak = 0;
+                    g_stripChanged = true;
+                }
+                g_stripValid = true;
+            }
+
+            if (needSwap) {
+                WriteIntSafe(g_pStart, v);
+                if (covered) BitBlt(wdc, lower.left, lower.top, lw, lh, g_lowerCache.dc, 0, 0, SRCCOPY);
+                else RedrawWindow(g_host, &area, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+            }
+            ReleaseDC(g_host, wdc);
+
+            if (hideOverlay) {
+                InvalidateRect(g_overlay, nullptr, FALSE);
+                ShowWindow(g_overlay, SW_SHOWNOACTIVATE);
+                UpdateWindow(g_overlay);
+            } else {
+                UpdateOverlayPlacement(v);
+                if (g_stripChanged && g_overlay && IsWindowVisible(g_overlay)) {
+                    InvalidateRect(g_overlay, nullptr, FALSE);
+                    UpdateWindow(g_overlay);
+                }
+            }
+            if (covered) ShowWindow(g_cover, SW_HIDE);
+        }
+    }
+#ifdef LP_DEBUG_LOG
+    {
+        static int n = 0;
+        LARGE_INTEGER f, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t1);
+        if (v > 0 && ++n <= 200)
+            LogF(L"RefreshStrip ok=%d v=%d took %.2f ms",
+                 (int)ok, v, (double)(t1.QuadPart - t_begin.QuadPart) * 1000.0 / f.QuadPart);
+    }
+#endif
+    g_lastRefresh = GetTickCount64();
+    InterlockedExchange(&g_refreshing, 0);
+    return ok;
+}
+
+static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
+static LRESULT CALLBACK CoverProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
+
+static void EnsureOverlay() {
+    if (g_overlay || !g_host) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor   = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpfnWndProc   = OverlayProc;
+        wc.lpszClassName = L"LayerPinningStrip";
+        RegisterClassExW(&wc);
+        wc.lpfnWndProc   = CoverProc;
+        wc.lpszClassName = L"LayerPinningCover";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    g_overlay = CreateWindowExW(WS_EX_NOACTIVATE, L"LayerPinningStrip", L"",
+                                WS_CHILD, 0, 0, 1, 1,
+                                g_host, nullptr, GetModuleHandleW(nullptr), nullptr);
+    g_cover   = CreateWindowExW(WS_EX_NOACTIVATE, L"LayerPinningCover", L"",
+                                WS_CHILD, 0, 0, 1, 1,
+                                g_host, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (g_overlay) SetTimer(g_overlay, kTimerId, kTimerMs, nullptr);
+    LogF(L"overlay=%p cover=%p", (void*)g_overlay, (void*)g_cover);
+}
+
+static LRESULT CALLBACK CoverProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+        case WM_NCHITTEST:  return HTTRANSPARENT;
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+            RECT rc; GetClientRect(h, &rc);
+#ifdef LP_DEBUG_COVER
+            HBRUSH br = CreateSolidBrush(RGB(255, 0, 255));
+            FillRect(dc, &rc, br); DeleteObject(br);
+#else
+            if (g_lowerCache.dc)
+                BitBlt(dc, 0, 0, rc.right, rc.bottom, g_lowerCache.dc, 0, 0, SRCCOPY);
+#endif
+            EndPaint(h, &ps);
+            return 0;
+        }
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
+static bool OverlayShouldShow(int v) {
+    return PinningActive() && g_stripValid && v > 0;
+}
+
+static void UpdateOverlayPlacement(int v) {
+    if (!g_overlay) return;
+    RECT strip;
+    if (!OverlayShouldShow(v) || !PinnedStripRect(&strip)) {
+        if (IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
+        return;
+    }
+    RECT cur = {}; GetWindowRect(g_overlay, &cur);
+    POINT tl = { strip.left, strip.top }; ClientToScreen(g_host, &tl);
+    int w = strip.right - strip.left, h = strip.bottom - strip.top;
+    if (cur.left != tl.x || cur.top != tl.y ||
+        (cur.right - cur.left) != w || (cur.bottom - cur.top) != h) {
+        SetWindowPos(g_overlay, HWND_TOP, strip.left, strip.top, w, h,
+                     SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+    if (!IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_SHOWNOACTIVATE);
+}
+
+static void OnTick() {
+    if (g_pinCount <= 0) {
+        if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
+        return;
+    }
+    if (!g_pStart) {
+        if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
+        EDIT_INFO probe = {};
+        g_edit->get_edit_info(&probe, sizeof(probe));
+        if (probe.layer_max + 1 > probe.display_layer_num) EnsureStartPointerAsync();
+        return;
+    }
+    if (!PinningActive()) {
+        if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
+        return;
+    }
+    int v = 0;
+    if (!ReadIntSafe(g_pStart, &v)) return;
+
+    EDIT_INFO info = {};
+    g_edit->get_edit_info(&info, sizeof(info));
+    if (info.display_frame_start != g_watch.frameStart ||
+        info.frame               != g_watch.frame      ||
+        info.display_layer_num   != g_watch.layerNum) {
+        g_watch.frameStart = info.display_frame_start;
+        g_watch.frame      = info.frame;
+        if (info.display_layer_num != g_watch.layerNum) {
+            g_watch.layerNum = info.display_layer_num;
+            g_geo.displayLayerNum = info.display_layer_num;
+            g_stripValid = false;
+        }
+        InterlockedExchange(&g_dirty, 1);
+    }
+
+    bool dirty = InterlockedExchange(&g_dirty, 0) != 0;
+
+    if (dirty && g_stripValid) {
+        const ULONGLONG minGap = (ULONGLONG)kTimerMs * (1 + g_idleStreak);
+        if (GetTickCount64() - g_lastRefresh < minGap) {
+            InterlockedExchange(&g_dirty, 1);
+            dirty = false;
+        }
+    }
+    if (!g_stripValid) dirty = true;
+
+    if (dirty && !g_locating) RefreshStrip();
+    else if (dirty) InterlockedExchange(&g_dirty, 1);
+    if (v != g_lastV) g_lastV = v;
+    UpdateOverlayPlacement(v);
+}
+
+static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+            RECT rc; GetClientRect(h, &rc);
+            if (g_stripValid && g_stripCache.dc)
+                BitBlt(dc, 0, 0, rc.right, rc.bottom, g_stripCache.dc, 0, 0, SRCCOPY);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_TIMER:
+            if (wp == kTimerId) { OnTick(); return 0; }
+            break;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
 static const wchar_t* MenuTextPin() {
     return g_config ? g_config->translate(g_config, L"レイヤーを固定") : L"レイヤーを固定";
 }
@@ -475,10 +813,13 @@ static void ApplyPinChange(EDIT_SECTION* edit, bool wantPin) {
     }
 
     g_pinByScene[g_sceneId] = g_pinCount;
+    g_stripValid = false;
     InterlockedExchange(&g_dirty, 1);
     LogF(L"pinCount %d -> %d (layer %d, scene %d)", before, g_pinCount, layer, g_sceneId);
 
+    EnsureOverlay();
     if (g_pinCount > 0) EnsureStartPointerAsync();
+    else if (g_overlay && IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_HIDE);
 
     if (g_host) InvalidateRect(g_host, nullptr, FALSE);
 }
@@ -491,9 +832,23 @@ static void OnChangeScene(EDIT_SECTION* edit) {
     auto it = g_pinByScene.find(g_sceneId);
     g_pinCount = (it == g_pinByScene.end()) ? 0 : it->second;
     g_pStart = nullptr;
+    g_stripValid = false;
     InterlockedExchange(&g_dirty, 1);
     ProbeGeometry(edit);
     if (g_pinCount > 0) EnsureStartPointerAsync();
+}
+
+static void OnAnyEvent(void*) {
+    g_idleStreak = 0;
+    InterlockedExchange(&g_dirty, 1);
+    if (!g_edit) return;
+    EDIT_INFO info = {};
+    g_edit->get_edit_info(&info, sizeof(info));
+    if (info.display_layer_num != g_geo.displayLayerNum) {
+        g_geo.displayLayerNum = info.display_layer_num;
+        g_stripValid = false;
+        RequestProbeGeometry();
+    }
 }
 
 COMMON_PLUGIN_TABLE common_plugin_table = {
@@ -516,6 +871,10 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
     host->register_layer_menu(MenuTextPin(), OnPinMenu);
     host->register_layer_menu(MenuTextUnpin(), OnUnpinMenu);
     host->register_change_scene_handler(OnChangeScene);
+    host->register_event_listener(EVENT_TYPE::UPDATE_OBJECT,       nullptr, OnAnyEvent);
+    host->register_event_listener(EVENT_TYPE::CHANGE_EDIT_FRAME,   nullptr, OnAnyEvent);
+    host->register_event_listener(EVENT_TYPE::CHANGE_FOCUS_OBJECT, nullptr, OnAnyEvent);
+    host->register_event_listener(EVENT_TYPE::CHANGE_EDIT_SCENE,   nullptr, OnAnyEvent);
 
     g_tpmSlot = FindIatSlot(GetModuleHandleW(nullptr), "USER32.dll", "TrackPopupMenu");
     if (g_tpmSlot) PatchSlot(g_tpmSlot, (void*)&Hook_TrackPopupMenu, (void**)&g_origTPM);
@@ -525,6 +884,9 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
     if (g_tpmSlot && g_origTPM) PatchSlot(g_tpmSlot, (void*)g_origTPM, nullptr);
+    if (g_overlay) { KillTimer(g_overlay, kTimerId); DestroyWindow(g_overlay); g_overlay = nullptr; }
+    g_stripCache.Release();
+    g_lowerCache.Release();
 }
 
 BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
