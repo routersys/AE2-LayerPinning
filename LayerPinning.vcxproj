@@ -99,6 +99,7 @@
     <ClCompile Include="src\Log.cpp" />
     <ClCompile Include="src\OverlayWindow.cpp" />
     <ClCompile Include="src\PinState.cpp" />
+    <ClCompile Include="src\PinningStatus.cpp" />
     <ClCompile Include="src\RefreshRequest.cpp" />
     <ClCompile Include="src\SafeMemory.cpp" />
     <ClCompile Include="src\ScrollAnchor.cpp" />
@@ -111,6 +112,7 @@
     <ClInclude Include="src\Log.h" />
     <ClInclude Include="src\OverlayWindow.h" />
     <ClInclude Include="src\PinState.h" />
+    <ClInclude Include="src\PinningStatus.h" />
     <ClInclude Include="src\PixelCache.h" />
     <ClInclude Include="src\RefreshRequest.h" />
     <ClInclude Include="src\SafeMemory.h" />

@@ -8,6 +8,7 @@
 #include "Log.h"
 #include "OverlayWindow.h"
 #include "PinState.h"
+#include "PinningStatus.h"
 #include "RefreshRequest.h"
 #include "ScrollAnchor.h"
 
@@ -39,11 +40,6 @@ struct WatchedState {
 };
 static WatchedState g_watch;
 
-static bool PinningActive() {
-    return PinCount() > 0 && GeometryValid() && HasStartPointer();
-}
-
-static bool OverlayShouldShow(int v);
 static void OnTick();
 static void EndMenuRemap();
 
@@ -150,10 +146,6 @@ static void EnsureOverlay() {
     Cover().Create(HostWindow());
     Overlay().StartTicking(OnTick);
     LogF(L"overlay=%p cover=%p", (void*)Overlay().Hwnd(), (void*)Cover().Hwnd());
-}
-
-static bool OverlayShouldShow(int v) {
-    return PinningActive() && Overlay().Image().Valid() && v > 0;
 }
 
 static void OnTick() {
