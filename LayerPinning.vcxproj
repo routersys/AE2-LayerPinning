@@ -96,6 +96,7 @@
     <ClCompile Include="src\HostContext.cpp" />
     <ClCompile Include="src\InputRemap.cpp" />
     <ClCompile Include="src\LayerGeometry.cpp" />
+    <ClCompile Include="src\LayerMenuHook.cpp" />
     <ClCompile Include="src\LayerPinning.cpp" />
     <ClCompile Include="src\Log.cpp" />
     <ClCompile Include="src\OverlayWindow.cpp" />
@@ -112,6 +113,7 @@
     <ClInclude Include="src\HostContext.h" />
     <ClInclude Include="src\InputRemap.h" />
     <ClInclude Include="src\LayerGeometry.h" />
+    <ClInclude Include="src\LayerMenuHook.h" />
     <ClInclude Include="src\Log.h" />
     <ClInclude Include="src\OverlayWindow.h" />
     <ClInclude Include="src\PinState.h" />
