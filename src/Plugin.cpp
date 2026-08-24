@@ -11,7 +11,7 @@ using namespace lp;
 
 COMMON_PLUGIN_TABLE common_plugin_table = {
     L"レイヤー固定",
-    L"レイヤー固定 version 1.00",
+    L"レイヤー固定 version 1.0.0",
 };
 
 EXTERN_C __declspec(dllexport) COMMON_PLUGIN_TABLE* GetCommonPluginTable(void) {
