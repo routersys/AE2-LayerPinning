@@ -29,6 +29,7 @@ static WatchedState g_watch;
 static void OnTick();
 
 static void WakeTick() {
+    if (DrawHookActive()) return;
     Overlay().RequestTick();
 }
 
