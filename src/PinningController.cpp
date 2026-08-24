@@ -51,8 +51,10 @@ static void OnTick() {
     }
     if (!HasStartPointer()) {
         Overlay().Hide();
-        const EDIT_INFO probe = EditInfo();
-        if (probe.layer_max + 1 > probe.display_layer_num) EnsureStartPointerAsync();
+        if (!DrawHookSupported()) {
+            const EDIT_INFO probe = EditInfo();
+            if (probe.layer_max + 1 > probe.display_layer_num) EnsureStartPointerAsync();
+        }
         return;
     }
     if (DrawHookActive()) {
@@ -133,8 +135,8 @@ static void ApplyPinChange(EDIT_SECTION* edit, bool wantPin) {
     LogF(L"pinCount %d -> %d (layer %d, scene %d)", before, PinCount(), layer, SceneId());
 
     EnsureOverlay();
-    if (PinCount() > 0) EnsureStartPointerAsync();
-    else Overlay().Hide();
+    if (PinCount() <= 0) Overlay().Hide();
+    else if (!DrawHookSupported()) EnsureStartPointerAsync();
     KeepDrawHookArmed();
 
     if (HostWindow()) InvalidateRect(HostWindow(), nullptr, FALSE);
@@ -159,7 +161,7 @@ void OnChangeScene(EDIT_SECTION* edit) {
     Overlay().Image().Invalidate();
     RequestRefresh();
     ProbeGeometry(edit);
-    if (PinCount() > 0) EnsureStartPointerAsync();
+    if (PinCount() > 0 && !DrawHookSupported()) EnsureStartPointerAsync();
 }
 
 void OnAnyEvent(void*) {
