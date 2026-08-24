@@ -18,6 +18,7 @@ bool HasStartPointer() { return g_pStart != nullptr; }
 bool ReadStart(int* out) { return ReadIntSafe(g_pStart, out); }
 bool WriteStart(int value) { return WriteIntSafe(g_pStart, value); }
 void ResetStartPointer() { g_pStart = nullptr; }
+void SetStartPointer(int* address) { g_pStart = address; }
 bool Locating() { return g_locating != 0; }
 bool PaintSuppressed() { return g_suppressPaint != 0; }
 
