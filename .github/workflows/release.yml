@@ -1,0 +1,369 @@
+name: リリース
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: ソースコードのチェックアウト
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: MSBuild のセットアップ
+        uses: microsoft/setup-msbuild@v2
+
+      - name: タグ名からバージョンを取得
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          echo "TAG=$tag" >> $env:GITHUB_OUTPUT
+          echo "VERSION=$($tag.TrimStart('v'))" >> $env:GITHUB_OUTPUT
+
+      - name: バージョン記載の照合
+        shell: pwsh
+        run: |
+          $tag     = "${{ steps.version.outputs.TAG }}"
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $problems = @()
+
+          $pluginPath = "src/Plugin.cpp"
+          $plugin = Get-Content $pluginPath -Raw
+          if (-not $plugin.Contains("レイヤー固定 version $version")) {
+            $current = if ($plugin -match 'レイヤー固定 version ([^"]*)') { $Matches[1] } else { "記載なし" }
+            $problems += "$pluginPath のバージョンが $current です。$version にしてください。"
+          }
+
+          $iniPath = ".github/package.ini"
+          $ini = Get-Content $iniPath -Raw
+          if (-not $ini.Contains("information=レイヤー固定 version $version")) {
+            $current = if ($ini -match '(?m)^information=レイヤー固定 version (\S+)') { $Matches[1] } else { "記載なし" }
+            $problems += "$iniPath の information が $current です。$version にしてください。"
+          }
+
+          $readmePath = ".github/Plugin_Readme.txt"
+          $readme = Get-Content $readmePath -Raw
+          if (-not $readme.Contains(" レイヤー固定 for AviUtl ExEdit2 $tag")) {
+            $current = if ($readme -match '(?m)^ レイヤー固定 for AviUtl ExEdit2 (\S+)') { $Matches[1] } else { "記載なし" }
+            $problems += "$readmePath の見出しが $current です。$tag にしてください。"
+          }
+
+          $documentPath = "README.md"
+          $document = Get-Content $documentPath -Raw
+          foreach ($name in @("LayerPinning_$tag.au2pkg.zip", "LayerPinning_$tag.zip")) {
+            if (-not $document.Contains($name)) {
+              $problems += "$documentPath が $name を案内していません。"
+            }
+          }
+
+          if ($problems.Count -eq 0) {
+            Write-Host "バージョン記載は $tag と一致しています"
+            exit 0
+          }
+
+          foreach ($problem in $problems) {
+            Write-Host "::error::$problem"
+          }
+          Write-Host "::error::リリースの対象は $tag が指すコミットです。タグを付けた後で main へ訂正を積んでも、その訂正はリリースに入りません。タグを削除し、記載を直したコミットを積んでから付け直してください。"
+          exit 1
+
+      - name: プロジェクトのビルド
+        shell: pwsh
+        run: |
+          & msbuild "LayerPinning.sln" `
+            /t:Rebuild `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /v:minimal `
+            /nologo `
+            /fl "/flp:LogFile=build.log;Verbosity=minimal;Encoding=UTF-8"
+          $code = $LASTEXITCODE
+
+          $log = @()
+          if (Test-Path "build.log") {
+            $log = @(Get-Content "build.log")
+            $log | ForEach-Object { Write-Host $_ }
+          }
+
+          if ($code -ne 0) {
+            Write-Host "::error::ビルドに失敗しました。"
+            exit 1
+          }
+
+          $warnings = @($log | Where-Object { $_ -match '\bwarning\b' })
+          if ($warnings.Count -gt 0) {
+            foreach ($warning in $warnings) {
+              Write-Host "::error::$warning"
+            }
+            Write-Host "::error::本リポジトリは警告0を維持します。警告を解消してから付け直してください。"
+            exit 1
+          }
+
+      - name: パッケージの作成
+        id: package
+        shell: pwsh
+        run: |
+          $tag       = "${{ steps.version.outputs.TAG }}"
+          $binary    = "build/Release/LayerPinning.aux2"
+          $stageRoot = "stage/package"
+          $plainRoot = "stage/plain/LayerPinning"
+          $pkgName   = "LayerPinning_$tag.au2pkg.zip"
+          $zipName   = "LayerPinning_$tag.zip"
+
+          if (-not (Test-Path $binary)) {
+            Write-Error "ビルド結果が見つかりませんでした: $binary"
+            exit 1
+          }
+
+          New-Item -ItemType Directory -Path "$stageRoot/Plugin" -Force | Out-Null
+          Copy-Item $binary                     "$stageRoot/Plugin/LayerPinning.aux2"
+          Copy-Item ".github/package.ini"       "$stageRoot/package.ini"
+          Copy-Item ".github/Plugin_Readme.txt" "$stageRoot/package.txt"
+
+          New-Item -ItemType Directory -Path "$plainRoot/LICENSE" -Force | Out-Null
+          Copy-Item $binary                          "$plainRoot/LayerPinning.aux2"
+          Copy-Item ".github/Plugin_Readme.txt"      "$plainRoot/Readme.txt"
+          Copy-Item "LICENSE.txt"                    "$plainRoot/LICENSE/LayerPinning.txt"
+          Copy-Item ".github/LICENSE/*.txt"          "$plainRoot/LICENSE/"
+
+          $packaged = Get-Content "$stageRoot/package.txt" -Raw
+          if (-not $packaged.Contains(" レイヤー固定 for AviUtl ExEdit2 $tag")) {
+            Write-Error "同梱する package.txt の見出しが $tag と一致しません"
+            exit 1
+          }
+
+          Compress-Archive -Path "$stageRoot/*"     -DestinationPath $pkgName -CompressionLevel Optimal
+          Compress-Archive -Path "stage/plain/*"    -DestinationPath $zipName -CompressionLevel Optimal
+          echo "PKG_NAME=$pkgName" >> $env:GITHUB_OUTPUT
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_OUTPUT
+
+      - name: 変更履歴の作成
+        id: changelog
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.TAG }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          PACKAGE: ${{ steps.package.outputs.PKG_NAME }}
+          ARCHIVE: ${{ steps.package.outputs.ZIP_NAME }}
+        run: |
+          $tag        = $env:TAG
+          $repository = $env:REPOSITORY
+          $server     = $env:SERVER_URL
+          $code       = [char]0x60
+          $fence      = [string]::new($code, 3)
+          $unit       = [char]0x1f
+
+          $previous = ""
+          $candidates = @(git tag --list "v*" --merged $tag --sort=-creatordate | Where-Object { $_ -ne $tag })
+          if ($candidates.Count -gt 0) {
+            $previous = $candidates[0]
+          }
+          Write-Host "直前のタグ: $previous"
+
+          $range = if ($previous) { "$previous..$tag" } else { $tag }
+          $log = @(git log "--format=%H%x1f%s%x1f%an%x1f%ad" --date=short $range)
+
+          $commits = @()
+          foreach ($line in $log) {
+            if (-not $line) { continue }
+            $fields = $line -split $unit
+            if ($fields.Count -lt 4) { continue }
+            $commits += [pscustomobject]@{
+              Sha     = $fields[0]
+              Subject = $fields[1]
+              Name    = $fields[2]
+              Date    = $fields[3]
+              Login   = ""
+              Avatar  = ""
+            }
+          }
+          Write-Host "コミット数: $($commits.Count)"
+
+          $pending = [System.Collections.Generic.HashSet[string]]::new()
+          foreach ($commit in $commits) {
+            [void]$pending.Add($commit.Sha)
+          }
+
+          $accounts = @{}
+          $page = 1
+          while ($pending.Count -gt 0 -and $page -le 20) {
+            $rows = @()
+            try {
+              $rows = @(gh api "repos/$repository/commits?sha=$tag&per_page=100&page=$page" --jq '.[] | [.sha, (.author.login // ""), (.author.avatar_url // "")] | @tsv')
+            }
+            catch {
+              Write-Host "コミットの作者を取得できませんでした: $($_.Exception.Message)"
+              break
+            }
+            if ($LASTEXITCODE -ne 0 -or $rows.Count -eq 0) { break }
+
+            foreach ($row in $rows) {
+              $fields = $row -split "`t"
+              if ($fields.Count -lt 3) { continue }
+              if ($pending.Remove($fields[0])) {
+                $accounts[$fields[0]] = @{ Login = $fields[1]; Avatar = $fields[2] }
+              }
+            }
+
+            if ($rows.Count -lt 100) { break }
+            $page++
+          }
+
+          foreach ($commit in $commits) {
+            if ($accounts.ContainsKey($commit.Sha)) {
+              $commit.Login  = $accounts[$commit.Sha].Login
+              $commit.Avatar = $accounts[$commit.Sha].Avatar
+            }
+          }
+
+          $emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+          $base = if ($previous) { $previous } else { $emptyTree }
+          $shortstat = (@(git diff --shortstat $base $tag) -join " ")
+          $changedFiles = 0
+          $insertions   = 0
+          $deletions    = 0
+          if ($shortstat -match "(\d+) file")      { $changedFiles = [int]$Matches[1] }
+          if ($shortstat -match "(\d+) insertion") { $insertions   = [int]$Matches[1] }
+          if ($shortstat -match "(\d+) deletion")  { $deletions    = [int]$Matches[1] }
+          $diffStat = @(git diff --stat $base $tag)
+          $tagDate = (git log -1 "--format=%ad" --date=short $tag)
+
+          $contributors = @($commits |
+            Group-Object -Property { if ($_.Login) { $_.Login } else { $_.Name } } |
+            Sort-Object -Property Count -Descending)
+
+          function Get-Icon($avatar, $login, $size) {
+            if (-not $avatar) { return "" }
+            $sized = if ($avatar.Contains("?")) { "$avatar&s=$($size * 2)" } else { "$avatar" + "?s=$($size * 2)" }
+            return "<img src=""$sized"" width=""$size"" height=""$size"" alt=""$login""> "
+          }
+
+          $body = [System.Collections.Generic.List[string]]::new()
+          $body.Add("## 概要")
+          $body.Add("")
+          $body.Add("| 項目 | 内容 |")
+          $body.Add("|---|---|")
+          $body.Add("| タグ | [$tag]($server/$repository/tree/$tag) |")
+          $body.Add("| 公開日 | $tagDate |")
+          if ($previous) {
+            $body.Add("| 直前のリリース | [$previous]($server/$repository/releases/tag/$previous) |")
+          }
+          $body.Add("| コミット数 | $($commits.Count) |")
+          $body.Add("| 貢献者 | $($contributors.Count) 名 |")
+          $body.Add("| 変更されたファイル | $changedFiles |")
+          $body.Add("| 追加された行 | $insertions |")
+          $body.Add("| 削除された行 | $deletions |")
+
+          $body.Add("")
+          $body.Add("## ダウンロード")
+          $body.Add("")
+          $body.Add("| ファイル | 用途 | サイズ |")
+          $body.Add("|---|---|---|")
+          foreach ($entry in @(
+            @{ Path = $env:PACKAGE; Use = "プレビュー画面へドロップしてインストールします" },
+            @{ Path = $env:ARCHIVE; Use = "手動で配置する場合に使います" })) {
+            $file = Get-Item $entry.Path
+            $size = [math]::Round($file.Length / 1MB, 2)
+            $body.Add("| $($file.Name) | $($entry.Use) | $size MB |")
+          }
+
+          $body.Add("")
+          $body.Add("## 貢献者")
+          $body.Add("")
+          $body.Add("| 貢献者 | コミット数 |")
+          $body.Add("|---|---|")
+          foreach ($contributor in $contributors) {
+            $first = $contributor.Group[0]
+            if ($first.Login) {
+              $name = (Get-Icon $first.Avatar $first.Login 40) + "[@$($first.Login)]($server/$($first.Login))"
+            }
+            else {
+              $name = $first.Name
+            }
+            $body.Add("| $name | $($contributor.Count) |")
+          }
+
+          $body.Add("")
+          $body.Add("## 変更履歴")
+          $body.Add("")
+          $body.Add("| コミット | 内容 | 貢献者 | 日付 |")
+          $body.Add("|---|---|---|---|")
+          $maximumCommits = 300
+          $listed = 0
+          foreach ($commit in $commits) {
+            if ($listed -ge $maximumCommits) { break }
+            $short = $commit.Sha.Substring(0, 7)
+            $subject = $commit.Subject -replace '\|', '\|'
+            if ($commit.Login) {
+              $author = (Get-Icon $commit.Avatar $commit.Login 20) + "[@$($commit.Login)]($server/$($commit.Login))"
+            }
+            else {
+              $author = $commit.Name
+            }
+            $body.Add("| [$code$short$code]($server/$repository/commit/$($commit.Sha)) | $subject | $author | $($commit.Date) |")
+            $listed++
+          }
+          if ($commits.Count -gt $maximumCommits) {
+            $body.Add("")
+            $body.Add("残り $($commits.Count - $maximumCommits) 件のコミットは省略しました。")
+          }
+
+          if ($diffStat.Count -gt 0) {
+            $body.Add("")
+            $body.Add("## 変更されたファイル")
+            $body.Add("")
+            $body.Add("<details>")
+            $body.Add("<summary>差分の統計</summary>")
+            $body.Add("")
+            $body.Add($fence)
+            $maximumStatLines = 200
+            $shown = 0
+            foreach ($line in $diffStat) {
+              if ($shown -ge $maximumStatLines) { break }
+              $body.Add($line)
+              $shown++
+            }
+            if ($diffStat.Count -gt $maximumStatLines) {
+              $body.Add("... 残り $($diffStat.Count - $maximumStatLines) 行は省略しました。")
+            }
+            $body.Add($fence)
+            $body.Add("")
+            $body.Add("</details>")
+          }
+
+          if ($previous) {
+            $body.Add("")
+            $body.Add("## 全ての変更")
+            $body.Add("")
+            $body.Add("$server/$repository/compare/$previous...$tag")
+          }
+
+          $path = "release-body.md"
+          Set-Content -Path $path -Value ($body -join "`n") -Encoding utf8NoBOM
+          if (-not (Test-Path $path)) {
+            throw "変更履歴を作成できませんでした。"
+          }
+          Write-Host "変更履歴の行数: $($body.Count)"
+          $global:LASTEXITCODE = 0
+
+      - name: GitHub リリースの作成
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.version.outputs.TAG }}
+          body_path: release-body.md
+          files: |
+            ${{ steps.package.outputs.PKG_NAME }}
+            ${{ steps.package.outputs.ZIP_NAME }}
+          draft: false
+          prerelease: false
