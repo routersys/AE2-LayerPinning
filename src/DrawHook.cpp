@@ -35,6 +35,12 @@ static const unsigned long long kRowCountOffset = 0x538;
 static const unsigned long long kLoopAInfoOffset = 0xf0;
 static const unsigned long long kLoopCInfoOffset = 0xf8;
 
+static const unsigned long long kSceneOffset = 0xd0;
+static const unsigned long long kViewOffset = 0x850;
+static const unsigned long long kLayerStartOffset = 0x1c4;
+static const unsigned long long kFrameStartOffset = 0x1bc;
+static const unsigned long long kLayerNumOffset = 0x1c8;
+
 static const DWORD64 kSlotMask = 0xffff00ffull;
 static const DWORD64 kSlotEnable = 0x55ull;
 static const ULONGLONG kWatchdogMs = 100;
@@ -68,6 +74,29 @@ static volatile ULONGLONG g_lastLoopAt = 0;
 void SetRemapBase(int value) { g_remapBase = value; g_remapActive = true; }
 void ClearRemapBase() { g_remapActive = false; }
 
+static int* g_candidate = nullptr;
+
+static int* DeriveStartAddress(DWORD64 object) {
+    void* scene = nullptr;
+    if (!ReadPtrSafe((void* const*)(object + kSceneOffset), &scene) || !scene) return nullptr;
+    void* view = nullptr;
+    if (!ReadPtrSafe((void* const*)((unsigned char*)scene + kViewOffset), &view) || !view) return nullptr;
+    return (int*)((unsigned char*)view + kLayerStartOffset);
+}
+
+static bool CandidateMatchesEditInfo(int* address) {
+    if (!address) return false;
+    unsigned char* view = (unsigned char*)address - kLayerStartOffset;
+    const EDIT_INFO info = EditInfo();
+    int value = 0;
+    if (!ReadIntSafe(address, &value) || value != info.display_layer_start) return false;
+    if (!ReadIntSafe((const int*)(view + kFrameStartOffset), &value) ||
+        value != info.display_frame_start) return false;
+    if (!ReadIntSafe((const int*)(view + kLayerNumOffset), &value) ||
+        value != info.display_layer_num) return false;
+    return true;
+}
+
 static bool ReadRowCount(DWORD64 object, unsigned long long infoOffset, int* out) {
     void* info = nullptr;
     if (!ReadPtrSafe((void* const*)(object + infoOffset), &info)) return false;
@@ -84,6 +113,10 @@ static int CapPinnedRows(int rows) {
 static void EnterRow(LoopState& state, int row, DWORD64 object, unsigned long long infoOffset) {
     if (row == 0) {
         state.live = false;
+        if (!HasStartPointer()) {
+            g_candidate = DeriveStartAddress(object);
+            return;
+        }
         int memory = 0, rows = 0;
         if (!ReadStart(&memory)) return;
         if (!ReadRowCount(object, infoOffset, &rows)) return;
@@ -208,8 +241,28 @@ static void RunWatchdog() {
     if (ReadStart(&current) && current != g_lastRestore) WriteStart(g_lastRestore);
 }
 
+static const int kNudgeInterval = 8;
+static int g_nudge = 0;
+
+static void AdoptCandidate() {
+    if (HasStartPointer()) return;
+    if (!g_candidate) {
+        if (++g_nudge >= kNudgeInterval) {
+            g_nudge = 0;
+            if (HostWindow()) InvalidateRect(HostWindow(), nullptr, FALSE);
+        }
+        return;
+    }
+    g_nudge = 0;
+    int* candidate = g_candidate;
+    g_candidate = nullptr;
+    if (!CandidateMatchesEditInfo(candidate)) return;
+    SetStartPointer(candidate);
+    LogF(L"レイヤー固定: 表示開始レイヤー番号の位置を本体の描画から特定しました");
+}
+
 void KeepDrawHookArmed() {
-    if (!DrawHookSupported() || !HasStartPointer() || PinCount() <= 0) {
+    if (!DrawHookSupported() || PinCount() <= 0) {
         ReleaseDrawHook();
         return;
     }
@@ -219,6 +272,7 @@ void KeepDrawHookArmed() {
     if (!g_active) {
         g_stateA.live = false;
         g_stateC.live = false;
+        g_candidate = nullptr;
         if (!WithThreadContext(GetCurrentThreadId(), ApplyArm)) return;
         g_armedThread = GetCurrentThreadId();
         InterlockedExchange(&g_active, 1);
@@ -226,6 +280,7 @@ void KeepDrawHookArmed() {
         return;
     }
     if (!StillArmed(g_armedThread)) WithThreadContext(g_armedThread, ApplyArm);
+    AdoptCandidate();
     RunWatchdog();
 }
 
@@ -236,6 +291,7 @@ void ReleaseDrawHook() {
         g_armedThread = 0;
         g_stateA.live = false;
         g_stateC.live = false;
+        g_candidate = nullptr;
         if (g_inLoop) {
             InterlockedExchange(&g_inLoop, 0);
             int current = 0;
