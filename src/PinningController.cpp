@@ -59,8 +59,6 @@ static void OnTick() {
     }
     if (DrawHookActive()) {
         ExpireCover();
-        int held = 0;
-        if (ReadStart(&held)) ApplyScrollHold(held);
         Overlay().Hide();
         return;
     }

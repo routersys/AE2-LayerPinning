@@ -58,8 +58,10 @@ void EndMenuRemap() {
     g_menuRemapUntil = 0;
     g_remapping = false;
     WriteStart(g_menuRemapV);
-    g_userV = g_menuRemapV;
-    g_holdUntil = GetTickCount64() + kHoldMs;
+    if (!DrawHookActive()) {
+        g_userV = g_menuRemapV;
+        g_holdUntil = GetTickCount64() + kHoldMs;
+    }
     if (g_menuCovered) g_coverUntil = GetTickCount64() + kCoverMs;
     g_menuCovered = false;
     RequestRefresh();
@@ -104,8 +106,10 @@ LRESULT HandleMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool* handled) {
     ClearRemapBase();
     g_remapping = false;
 
-    g_userV = v;
-    g_holdUntil = GetTickCount64() + kHoldMs;
+    if (!DrawHookActive()) {
+        g_userV = v;
+        g_holdUntil = GetTickCount64() + kHoldMs;
+    }
 
     if (covered) g_coverUntil = GetTickCount64() + kCoverMs;
     RequestRefresh();
